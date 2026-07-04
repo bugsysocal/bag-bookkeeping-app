@@ -1,7 +1,10 @@
 use rusqlite::Connection;
 
 /// Migrations, in order. `PRAGMA user_version` tracks the last applied index + 1.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_initial.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_initial.sql"),
+    include_str!("../migrations/0002_license.sql"),
+];
 
 /// Open (or create) a LedgerOne database and bring it to the current schema.
 ///

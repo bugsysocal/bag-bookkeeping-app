@@ -630,13 +630,27 @@ pub struct PaymentResult {
 }
 
 fn recompute_invoice_status(conn: &Connection, invoice_id: &str) -> R<()> {
-    let paid: i64 = conn.query_row(
+    let allocated: i64 = conn.query_row(
         "SELECT COALESCE(SUM(pa.amount_kobo), 0) FROM payment_allocations pa
          JOIN payments p ON p.id = pa.payment_id
          WHERE pa.target_type = 'invoice' AND pa.target_id = ?1 AND p.voided = 0",
         params![invoice_id],
         |r| r.get(0),
     )?;
+    // Deposit applications settle AR without a payment row (Spec 03 §5.4): read them
+    // from the ledger itself — Cr AR lines of unreversed deposit_application entries.
+    let deposit_applied: i64 = conn.query_row(
+        "SELECT COALESCE(-SUM(l.amount_kobo), 0)
+         FROM journal_lines l
+         JOIN journal_entries e ON e.id = l.entry_id
+         JOIN accounts a ON a.id = l.account_id
+         WHERE e.source_type = 'deposit_application' AND e.source_id = ?1
+           AND e.is_posted = 1 AND e.reversed_by_entry_id IS NULL
+           AND a.system_key = 'AR'",
+        params![invoice_id],
+        |r| r.get(0),
+    )?;
+    let paid = allocated + deposit_applied;
     conn.execute(
         "UPDATE invoices SET amount_paid_kobo = ?2,
            status = CASE
@@ -671,6 +685,15 @@ fn recompute_bill_status(conn: &Connection, bill_id: &str) -> R<()> {
     Ok(())
 }
 
+/// FX receipt metadata (Spec 03 §5.3): NGN invoice settled into a domiciliary
+/// account. `amount_kobo` is the NGN equivalent; the difference vs the settled
+/// AR posts to FX_GAIN_LOSS as realized FX.
+#[derive(Debug, Clone)]
+pub struct FxReceipt {
+    pub currency: String,
+    pub fx_amount_kobo: i64, // minor units of the foreign currency
+}
+
 /// Customer receipt: Dr Bank + Dr WHT Receivable / Cr AR (allocations) / Cr
 /// Unearned Revenue (remainder = customer deposit). Generates an RCT number.
 #[allow(clippy::too_many_arguments)]
@@ -683,6 +706,7 @@ pub fn post_payment_in(
     amount_kobo: i64,
     wht_withheld_kobo: i64,
     allocations: &[Allocation],
+    fx: Option<FxReceipt>,
     ctx: &PostCtx,
 ) -> R<PaymentResult> {
     if amount_kobo <= 0 || wht_withheld_kobo < 0 {
@@ -715,19 +739,35 @@ pub fn post_payment_in(
         }
         alloc_total += a.amount_kobo;
     }
-    if alloc_total > gross {
-        return Err(EngineError::Validation(
-            "allocations exceed cash received + WHT".into(),
-        ));
-    }
-    let deposit = gross - alloc_total;
+    // FX receipts must allocate fully — a remainder is FX difference, never a
+    // deposit (deposits in foreign currency are out of v1 scope, Spec 03 §5.3).
+    let (deposit, fx_diff) = if fx.is_some() {
+        if alloc_total == 0 {
+            return Err(EngineError::Validation(
+                "FX receipts must be allocated to invoices".into(),
+            ));
+        }
+        (0i64, amount_kobo - (alloc_total - wht_withheld_kobo))
+    } else {
+        if alloc_total > gross {
+            return Err(EngineError::Validation(
+                "allocations exceed cash received + WHT".into(),
+            ));
+        }
+        (gross - alloc_total, 0i64)
+    };
 
     let contact_name: String = conn.query_row(
         "SELECT name FROM contacts WHERE id = ?1", params![contact_id], |r| r.get(0),
     )?;
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut je = vec![LineSpec::new(&b.account_id, amount_kobo)];
+    let mut bank_line = LineSpec::new(&b.account_id, amount_kobo);
+    if let Some(f) = &fx {
+        bank_line.fx_currency = Some(f.currency.clone());
+        bank_line.fx_amount_kobo = Some(f.fx_amount_kobo);
+    }
+    let mut je = vec![bank_line];
     if wht_withheld_kobo > 0 {
         je.push(LineSpec::new(&sys(&tx, company_id, "WHT_RECEIVABLE")?, wht_withheld_kobo));
     }
@@ -738,6 +778,11 @@ pub fn post_payment_in(
         je.push(LineSpec::with_contact(
             &sys(&tx, company_id, "UNEARNED_REVENUE")?, -deposit, contact_id,
         ));
+    }
+    if fx_diff != 0 {
+        // Realized FX: gain when the naira received exceeds the AR settled (Cr),
+        // loss when it falls short (Dr). Line = -(diff) keeps the entry balanced.
+        je.push(LineSpec::new(&sys(&tx, company_id, "FX_GAIN_LOSS")?, -fx_diff));
     }
 
     let receipt = next_doc_number(&tx, company_id, "receipt")?;
@@ -985,15 +1030,181 @@ pub fn post_drawing(
     Ok(entry_id)
 }
 
-// ===== Reversal (Spec 01 §6.8) =====
+// ===== Quick expense (Spec 01 §6.3, Spec 04 §2) =====
 
-/// Nothing is ever deleted: create the negated twin, cross-link both.
-pub fn void_entry(
+/// Cash expense paid now — no AP. Dr category (gross − backed-out VAT) /
+/// Dr VAT Input / Cr Bank (gross − WHT) / Cr WHT Payable.
+/// `payee` is display text; a contact is optional (Spec 04 §2: free text does
+/// not create a contact). The bills-pipeline composite is UI-layer sugar; the
+/// ledger effect is identical and this is the Spec 01 §5.3 `postExpense` surface.
+#[allow(clippy::too_many_arguments)]
+pub fn post_expense(
     conn: &mut Connection,
-    entry_id: &str,
-    reversal_date: &str,
+    company_id: &str,
+    bank_account_id: &str,
+    payee: &str,
+    expense_account_id: &str,
+    expense_date: &str,
+    gross_kobo: i64,
+    vat_inclusive: bool,
+    wht_withheld_kobo: i64,
     ctx: &PostCtx,
 ) -> R<String> {
+    if gross_kobo <= 0 || wht_withheld_kobo < 0 || wht_withheld_kobo >= gross_kobo {
+        return Err(EngineError::Validation("invalid expense amounts".into()));
+    }
+    let c = cfg(conn, company_id)?;
+    check_soft_close(&c, expense_date, ctx)?;
+    let b = bank(conn, bank_account_id)?;
+    check_recon_lock(&b, expense_date)?;
+    let cash = gross_kobo - wht_withheld_kobo;
+    check_cash_floor(conn, &b, cash)?;
+
+    // Back out VAT from the entered amount (Spec 03 §6.3 / Spec 01 §6.3):
+    // vat = paid × rate / (10000 + rate).
+    let vat = if vat_inclusive && c.vat_registered {
+        round_ratio(gross_kobo as i128 * c.vat_rate_bp as i128, (10_000 + c.vat_rate_bp) as i128)
+    } else {
+        0
+    };
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut je = vec![LineSpec::new(expense_account_id, gross_kobo - vat)];
+    if vat > 0 {
+        je.push(LineSpec::new(&sys(&tx, company_id, "VAT_INPUT")?, vat));
+    }
+    je.push(LineSpec::new(&b.account_id, -cash));
+    if wht_withheld_kobo > 0 {
+        je.push(LineSpec::new(&sys(&tx, company_id, "WHT_PAYABLE")?, -wht_withheld_kobo));
+    }
+    let entry_id = post_entry_in(
+        &tx, company_id, expense_date,
+        &format!("Money out — {payee}"),
+        "expense", None, ctx.user_id.as_deref(), &je,
+    )?;
+    tx.commit()?;
+    Ok(entry_id)
+}
+
+// ===== Customer deposits (Spec 03 §5.4) =====
+
+/// Available deposit for a contact: the credit balance on Unearned Revenue lines
+/// carrying that contact — a live query, never a stored balance.
+pub fn deposit_balance(conn: &Connection, company_id: &str, contact_id: &str) -> R<i64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(-SUM(l.amount_kobo), 0)
+         FROM journal_lines l
+         JOIN journal_entries e ON e.id = l.entry_id
+         JOIN accounts a ON a.id = l.account_id
+         WHERE e.company_id = ?1 AND e.is_posted = 1
+           AND a.system_key = 'UNEARNED_REVENUE' AND l.contact_id = ?2",
+        params![company_id, contact_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Apply a held deposit to an open invoice: Dr Unearned Revenue / Cr AR.
+/// Never automatic — the caller (UI) has shown the confirm prompt (Spec 03 §5.4).
+pub fn apply_deposit(
+    conn: &mut Connection,
+    company_id: &str,
+    contact_id: &str,
+    invoice_id: &str,
+    amount_kobo: i64,
+    application_date: &str,
+    ctx: &PostCtx,
+) -> R<String> {
+    if amount_kobo <= 0 {
+        return Err(EngineError::Validation("amount must be positive".into()));
+    }
+    let c = cfg(conn, company_id)?;
+    check_soft_close(&c, application_date, ctx)?;
+    let (total, paid, status): (i64, i64, String) = conn
+        .query_row(
+            "SELECT total_kobo, amount_paid_kobo, status FROM invoices
+             WHERE id = ?1 AND company_id = ?2 AND contact_id = ?3 AND kind = 'invoice'",
+            params![invoice_id, company_id, contact_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EngineError::Validation("unknown invoice for this customer".into()))?;
+    if status != "sent" && status != "partially_paid" {
+        return Err(EngineError::Validation("invoice is not open".into()));
+    }
+    if amount_kobo > total - paid {
+        return Err(EngineError::Validation("application exceeds invoice balance".into()));
+    }
+    if amount_kobo > deposit_balance(conn, company_id, contact_id)? {
+        return Err(EngineError::Validation("not enough deposit held for this customer".into()));
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let je = vec![
+        LineSpec::with_contact(&sys(&tx, company_id, "UNEARNED_REVENUE")?, amount_kobo, contact_id),
+        LineSpec::with_contact(&sys(&tx, company_id, "AR")?, -amount_kobo, contact_id),
+    ];
+    let entry_id = post_entry_in(
+        &tx, company_id, application_date,
+        "Customer's advance payment used for this invoice",
+        "deposit_application", Some(invoice_id), ctx.user_id.as_deref(), &je,
+    )?;
+    recompute_invoice_status(&tx, invoice_id)?;
+    tx.commit()?;
+    Ok(entry_id)
+}
+
+/// Refund a held deposit: Dr Unearned Revenue / Cr Bank, as an outbound payment
+/// row with no allocations (Spec 03 §5.4 / §8.3 refundDeposit).
+pub fn refund_deposit(
+    conn: &mut Connection,
+    company_id: &str,
+    contact_id: &str,
+    bank_account_id: &str,
+    refund_date: &str,
+    amount_kobo: i64,
+    ctx: &PostCtx,
+) -> R<PaymentResult> {
+    if amount_kobo <= 0 {
+        return Err(EngineError::Validation("amount must be positive".into()));
+    }
+    let c = cfg(conn, company_id)?;
+    check_soft_close(&c, refund_date, ctx)?;
+    let b = bank(conn, bank_account_id)?;
+    check_recon_lock(&b, refund_date)?;
+    check_cash_floor(conn, &b, amount_kobo)?;
+    if amount_kobo > deposit_balance(conn, company_id, contact_id)? {
+        return Err(EngineError::Validation("not enough deposit held for this customer".into()));
+    }
+    let contact_name: String = conn.query_row(
+        "SELECT name FROM contacts WHERE id = ?1", params![contact_id], |r| r.get(0),
+    )?;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let je = vec![
+        LineSpec::with_contact(&sys(&tx, company_id, "UNEARNED_REVENUE")?, amount_kobo, contact_id),
+        LineSpec::new(&b.account_id, -amount_kobo),
+    ];
+    let entry_id = post_entry_in(
+        &tx, company_id, refund_date,
+        &format!("Advance payment returned — {contact_name}"),
+        "payment", None, ctx.user_id.as_deref(), &je,
+    )?;
+    let payment_id = new_id();
+    tx.execute(
+        "INSERT INTO payments (id, company_id, direction, contact_id, bank_account_id, payment_date,
+                               amount_kobo, wht_kobo, journal_entry_id, created_by, created_at)
+         VALUES (?1, ?2, 'out', ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9)",
+        params![payment_id, company_id, contact_id, bank_account_id, refund_date,
+                amount_kobo, entry_id, ctx.user_id, now_iso()],
+    )?;
+    tx.commit()?;
+    Ok(PaymentResult { payment_id, entry_id, receipt_number: None, wht_kobo: 0, deposit_kobo: -amount_kobo })
+}
+
+// ===== Reversal (Spec 01 §6.8) =====
+
+/// Core reversal inside the caller's transaction: negated twin, cross-linked.
+fn void_entry_in(conn: &Connection, entry_id: &str, reversal_date: &str, ctx: &PostCtx) -> R<String> {
     let (company_id, memo, posted, reversed_by): (String, String, i64, Option<String>) = conn
         .query_row(
             "SELECT company_id, memo, is_posted, reversed_by_entry_id FROM journal_entries WHERE id = ?1",
@@ -1008,13 +1219,9 @@ pub fn void_entry(
     if reversed_by.is_some() {
         return Err(EngineError::Validation("entry is already reversed".into()));
     }
-    let c = cfg(conn, &company_id)?;
-    check_soft_close(&c, reversal_date, ctx)?;
-
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut lines = Vec::new();
     {
-        let mut q = tx.prepare(
+        let mut q = conn.prepare(
             "SELECT account_id, amount_kobo, contact_id FROM journal_lines
              WHERE entry_id = ?1 ORDER BY line_no",
         )?;
@@ -1029,17 +1236,109 @@ pub fn void_entry(
         }
     }
     let rev_id = post_entry_in(
-        &tx, &company_id, reversal_date,
+        conn, &company_id, reversal_date,
         &format!("REVERSAL of: {memo}"),
         "reversal", Some(entry_id), ctx.user_id.as_deref(), &lines,
     )?;
-    tx.execute(
+    conn.execute(
         "UPDATE journal_entries SET reverses_entry_id = ?2 WHERE id = ?1",
         params![rev_id, entry_id],
     )?;
-    tx.execute(
+    conn.execute(
         "UPDATE journal_entries SET reversed_by_entry_id = ?2 WHERE id = ?1",
         params![entry_id, rev_id],
+    )?;
+    Ok(rev_id)
+}
+
+/// Nothing is ever deleted: create the negated twin, cross-link both.
+pub fn void_entry(
+    conn: &mut Connection,
+    entry_id: &str,
+    reversal_date: &str,
+    ctx: &PostCtx,
+) -> R<String> {
+    let company_id: String = conn
+        .query_row(
+            "SELECT company_id FROM journal_entries WHERE id = ?1",
+            params![entry_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| EngineError::Validation("unknown entry".into()))?;
+    let c = cfg(conn, &company_id)?;
+    check_soft_close(&c, reversal_date, ctx)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let rev_id = void_entry_in(&tx, entry_id, reversal_date, ctx)?;
+    tx.commit()?;
+    Ok(rev_id)
+}
+
+/// Document-level void (Spec 03 §6): blocked while money is attached; reverses
+/// the entry AND restores inventory at the ORIGINAL movement cost, not current WAC.
+pub fn void_invoice(
+    conn: &mut Connection,
+    invoice_id: &str,
+    reversal_date: &str,
+    ctx: &PostCtx,
+) -> R<Option<String>> {
+    let (company_id, status, paid, entry_id): (String, String, i64, Option<String>) = conn
+        .query_row(
+            "SELECT company_id, status, amount_paid_kobo, journal_entry_id FROM invoices WHERE id = ?1",
+            params![invoice_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EngineError::Validation("unknown invoice".into()))?;
+    match status.as_str() {
+        "draft" => {
+            // Drafts posted nothing; the row is kept, the number stays visible.
+            conn.execute("UPDATE invoices SET status = 'void' WHERE id = ?1", params![invoice_id])?;
+            return Ok(None);
+        }
+        "sent" | "partially_paid" | "paid" => {}
+        other => return Err(EngineError::Validation(format!("cannot void a {other} invoice"))),
+    }
+    if paid != 0 {
+        return Err(EngineError::Validation(
+            "money has been received against this invoice — first void the payment or move it to the customer's deposit (Spec 03 §6)".into(),
+        ));
+    }
+    let c = cfg(conn, &company_id)?;
+    check_soft_close(&c, reversal_date, ctx)?;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let rev_id = match &entry_id {
+        Some(eid) => {
+            let rev = void_entry_in(&tx, eid, reversal_date, ctx)?;
+            // Restore stock at original movement cost (Spec 01 §6.8).
+            let now = now_iso();
+            let mut q = tx.prepare(
+                "SELECT product_id, quantity_milli, unit_cost_kobo, total_cost_kobo
+                 FROM inventory_movements WHERE journal_entry_id = ?1 AND kind = 'sale'",
+            )?;
+            let rows: Vec<(String, i64, i64, i64)> = q
+                .query_map(params![eid], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            drop(q);
+            for (pid, qty, unit_cost, tot) in rows {
+                tx.execute(
+                    "INSERT INTO inventory_movements (id, company_id, product_id, movement_date, kind,
+                                                      quantity_milli, unit_cost_kobo, total_cost_kobo,
+                                                      journal_entry_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'reversal', ?5, ?6, ?7, ?8, ?9)",
+                    params![new_id(), company_id, pid, reversal_date, -qty, unit_cost, -tot, rev, now],
+                )?;
+            }
+            Some(rev)
+        }
+        None => None, // zero-total free sample without stock lines: document-only void
+    };
+    tx.execute(
+        "UPDATE invoices SET status = 'void', voided_by_entry = ?2 WHERE id = ?1",
+        params![invoice_id, rev_id],
     )?;
     tx.commit()?;
     Ok(rev_id)

@@ -95,6 +95,8 @@ pub struct CompanyConfig {
     pub tin: Option<String>,
     /// First invoice number for migrating businesses (Spec 02 §5.7); default 1.
     pub invoice_start: i64,
+    /// Spec 10 §3: stored identifier, offline, unvalidated in v1.
+    pub license_key: Option<String>,
 }
 
 impl Default for CompanyConfig {
@@ -109,6 +111,7 @@ impl Default for CompanyConfig {
             business_type: "trading".into(),
             tin: None,
             invoice_start: 1,
+            license_key: None,
         }
     }
 }
@@ -121,13 +124,14 @@ pub fn create_company(conn: &mut Connection, cfg: &CompanyConfig) -> Result<Stri
 
     tx.execute(
         "INSERT INTO companies (id, name, tin, vat_registered, vat_exempt, cit_exempt,
-                                inventory_enabled, fiscal_year_start_month, business_type, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                inventory_enabled, fiscal_year_start_month, business_type,
+                                license_key, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             company_id, cfg.name, cfg.tin,
             cfg.vat_registered as i64, cfg.vat_exempt as i64, cfg.cit_exempt as i64,
             cfg.inventory_enabled as i64, cfg.fiscal_year_start_month as i64,
-            cfg.business_type, now
+            cfg.business_type, cfg.license_key, now
         ],
     )?;
 

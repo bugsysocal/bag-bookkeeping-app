@@ -326,7 +326,7 @@ fn payment_in_partial_then_full_with_wht_and_deposit() {
         &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-10",
         500_000_00, 0,
         &[Allocation { target_id: inv.clone(), amount_kobo: 500_000_00 }],
-        &ctx,
+        None, &ctx,
     ).unwrap();
     assert_eq!(r1.receipt_number.as_deref(), Some("RCT-000001"));
     assert_eq!(invoice_status(&w.conn, &inv), "partially_paid");
@@ -337,7 +337,7 @@ fn payment_in_partial_then_full_with_wht_and_deposit() {
         &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-20",
         550_000_00, 50_000_00,
         &[Allocation { target_id: inv.clone(), amount_kobo: 575_000_00 }],
-        &ctx,
+        None, &ctx,
     ).unwrap();
     assert_eq!(r2.deposit_kobo, 25_000_00);
     assert_eq!(invoice_status(&w.conn, &inv), "paid");
@@ -368,9 +368,192 @@ fn payment_in_over_allocation_rejected() {
         &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-10",
         200_000_00, 0,
         &[Allocation { target_id: inv, amount_kobo: 150_000_00 }],
-        &ctx,
+        None, &ctx,
     );
     assert!(err.is_err());
+}
+
+// ===== Engine gaps closed 2026-07-04: expense, deposits, void_invoice, FX =====
+
+#[test]
+fn expense_backs_out_vat_and_splits_wht() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    post_drawing(&mut w.conn, &w.company, &w.bank, "2026-07-01", 500_000_00, false, &ctx).unwrap();
+    let power = acct_by_code(&w.conn, &w.company, "6200");
+
+    // ₦107,500 diesel receipt, price includes 7.5% VAT → net 100,000 + input VAT 7,500.
+    let e1 = post_expense(
+        &mut w.conn, &w.company, &w.bank, "Total Filling Station", &power,
+        "2026-07-04", 107_500_00, true, 0, &ctx,
+    ).unwrap();
+    assert_eq!(
+        entry_lines(&w.conn, &e1),
+        vec![
+            ("1010".into(), -107_500_00, false),
+            ("1310".into(), 7_500_00, false),
+            ("6200".into(), 100_000_00, false),
+        ]
+    );
+
+    // Contractor paid gross ₦100,000 with ₦5,000 WHT held back, no VAT.
+    let fees = acct_by_code(&w.conn, &w.company, "6600");
+    let e2 = post_expense(
+        &mut w.conn, &w.company, &w.bank, "Chuka the Electrician", &fees,
+        "2026-07-04", 100_000_00, false, 5_000_00, &ctx,
+    ).unwrap();
+    assert_eq!(
+        entry_lines(&w.conn, &e2),
+        vec![
+            ("1010".into(), -95_000_00, false),
+            ("2220".into(), -5_000_00, false),
+            ("6600".into(), 100_000_00, false),
+        ]
+    );
+    assert_eq!(trial_balance(&w.conn), 0);
+}
+
+#[test]
+fn deposit_lifecycle_apply_then_refund() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+
+    // Customer pays ₦200,000 ahead — pure deposit.
+    post_payment_in(
+        &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-01",
+        200_000_00, 0, &[], None, &ctx,
+    ).unwrap();
+    assert_eq!(deposit_balance(&w.conn, &w.company, &w.customer).unwrap(), 200_000_00);
+
+    // Invoice ₦150,000; apply the deposit; invoice settles with no new cash.
+    let inv = create_invoice(
+        &mut w.conn, &w.company, &w.customer, "invoice", "2026-07-04", "2026-07-18",
+        &[line("Goods", 1_000, 150_000_00, false)], &ctx,
+    ).unwrap();
+    post_invoice(&mut w.conn, inv.as_str(), &ctx).unwrap();
+    let app = apply_deposit(
+        &mut w.conn, &w.company, &w.customer, &inv, 150_000_00, "2026-07-05", &ctx,
+    ).unwrap();
+    assert_eq!(
+        entry_lines(&w.conn, &app),
+        vec![("1100".into(), -150_000_00, true), ("2300".into(), 150_000_00, true)]
+    );
+    assert_eq!(invoice_status(&w.conn, &inv), "paid");
+    assert_eq!(deposit_balance(&w.conn, &w.company, &w.customer).unwrap(), 50_000_00);
+
+    // Refund the remaining ₦50,000; over-refund must fail.
+    let r = refund_deposit(
+        &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-06", 50_000_00, &ctx,
+    ).unwrap();
+    assert_eq!(
+        entry_lines(&w.conn, &r.entry_id),
+        vec![("1010".into(), -50_000_00, false), ("2300".into(), 50_000_00, true)]
+    );
+    assert_eq!(deposit_balance(&w.conn, &w.company, &w.customer).unwrap(), 0);
+    assert!(refund_deposit(
+        &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-07", 1_00, &ctx,
+    ).is_err());
+    assert_eq!(trial_balance(&w.conn), 0);
+}
+
+#[test]
+fn void_invoice_restores_stock_and_blocks_when_paid() {
+    let mut w = world_with(CompanyConfig { inventory_enabled: true, ..Default::default() });
+    let ctx = PostCtx::default();
+    let inventory_acct = acct_by_code(&w.conn, &w.company, "1200");
+    let product = new_id();
+    w.conn.execute(
+        "INSERT INTO products (id, company_id, kind, name, sale_price_kobo, track_inventory)
+         VALUES (?1, ?2, 'product', 'Cement Bag', 950000, 1)",
+        params![product, w.company],
+    ).unwrap();
+    let bill = create_bill(
+        &mut w.conn, &w.company, &w.supplier, "2026-07-01", "2026-07-31", false, None,
+        &[BillLineInput {
+            product_id: Some(product.clone()), description: "Cement".into(),
+            quantity_milli: 10_000, unit_cost_kobo: 7_000_00,
+            vat_charged: false, vat_claimable: false,
+            expense_account_id: inventory_acct,
+        }],
+        &ctx,
+    ).unwrap();
+    post_bill(&mut w.conn, bill.as_str(), &ctx).unwrap();
+
+    let sell = |w: &mut World, qty: i64| {
+        create_invoice(
+            &mut w.conn, &w.company, &w.customer, "invoice", "2026-07-04", "2026-07-18",
+            &[InvoiceLineInput {
+                product_id: Some(product.clone()), description: "Cement Bag".into(),
+                quantity_milli: qty, unit_price_kobo: 9_500_00, discount_bp: 0,
+                vat_applied: false, income_account_id: None,
+            }],
+            &PostCtx::default(),
+        ).unwrap()
+    };
+
+    // Sell 4 bags, void the invoice: stock returns to 10 at original cost.
+    let inv = sell(&mut w, 4_000);
+    post_invoice(&mut w.conn, inv.as_str(), &ctx).unwrap();
+    let on_hand_after_sale: i64 = w.conn.query_row(
+        "SELECT SUM(quantity_milli) FROM inventory_movements WHERE product_id = ?1",
+        params![product], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(on_hand_after_sale, 6_000);
+
+    let rev = void_invoice(&mut w.conn, &inv, "2026-07-05", &ctx).unwrap();
+    assert!(rev.is_some());
+    let (on_hand, value): (i64, i64) = w.conn.query_row(
+        "SELECT SUM(quantity_milli), SUM(total_cost_kobo) FROM inventory_movements WHERE product_id = ?1",
+        params![product], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!((on_hand, value), (10_000, 70_000_00), "restored at original cost");
+    assert_eq!(invoice_status(&w.conn, &inv), "void");
+    assert_eq!(trial_balance(&w.conn), 0);
+
+    // A paid invoice refuses to void until the money is dealt with.
+    let inv2 = sell(&mut w, 2_000);
+    post_invoice(&mut w.conn, inv2.as_str(), &ctx).unwrap();
+    post_payment_in(
+        &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-06",
+        19_000_00, 0, &[Allocation { target_id: inv2.clone(), amount_kobo: 19_000_00 }],
+        None, &ctx,
+    ).unwrap();
+    assert!(void_invoice(&mut w.conn, &inv2, "2026-07-07", &ctx).is_err());
+}
+
+#[test]
+fn fx_receipt_posts_realized_gain() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    let dom = add_bank_account(&mut w.conn, &w.company, "USD Domiciliary", "domiciliary", "USD").unwrap();
+
+    let inv = create_invoice(
+        &mut w.conn, &w.company, &w.customer, "invoice", "2026-07-04", "2026-08-03",
+        &[line("Export order", 1_000, 1_000_000_00, false)], &ctx,
+    ).unwrap();
+    post_invoice(&mut w.conn, inv.as_str(), &ctx).unwrap();
+
+    // Customer wires $650; at today's rate that lands as ₦1,020,000 — ₦20,000 gain.
+    let r = post_payment_in(
+        &mut w.conn, &w.company, &w.customer, &dom, "2026-07-10",
+        1_020_000_00, 0,
+        &[Allocation { target_id: inv.clone(), amount_kobo: 1_000_000_00 }],
+        Some(FxReceipt { currency: "USD".into(), fx_amount_kobo: 650_00 }),
+        &ctx,
+    ).unwrap();
+    let lines = entry_lines(&w.conn, &r.entry_id);
+    assert!(lines.contains(&("1100".into(), -1_000_000_00, true)));
+    assert!(lines.contains(&("4900".into(), -20_000_00, false)), "realized FX gain, Cr");
+    assert_eq!(invoice_status(&w.conn, &inv), "paid");
+
+    // The bank line carries the FX metadata.
+    let (fx_cur, fx_amt): (String, i64) = w.conn.query_row(
+        "SELECT l.fx_currency, l.fx_amount_kobo FROM journal_lines l
+         WHERE l.entry_id = ?1 AND l.fx_currency IS NOT NULL",
+        params![r.entry_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!((fx_cur.as_str(), fx_amt), ("USD", 650_00));
+    assert_eq!(trial_balance(&w.conn), 0);
 }
 
 // ===== postPayment out: WHT split + exemption ladder (Spec 01 §6.2, Spec 04 §3) =====
