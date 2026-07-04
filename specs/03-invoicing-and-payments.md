@@ -1,5 +1,5 @@
 # Specification 03 — Invoicing & Payments Flow
-**Project:** LedgerOne (placeholder) · **Covers:** Planning doc §4.2, §11 item 3 · **Status:** APPROVED v1.0 (2026-07-03) — **except decision #9 (zero-total invoices), pending confirmation at next session**
+**Project:** LedgerOne (placeholder) · **Covers:** Planning doc §4.2, §11 item 3 · **Status:** APPROVED v1.1 — all decisions resolved (2026-07-03; #9 resolved: zero-total invoices allowed for free samples/promo stock)
 **Depends on:** Spec 01 (approved — posting templates §6.1/§6.2, void semantics §6.8), Spec 02 (approved — sequences, COA, roles).
 
 ---
@@ -52,7 +52,7 @@ Validations at **send** (draft save is permissive — half-finished drafts are f
 | V4 | customer `is_active`; free-description lines require a chosen income account |
 | V5 | inventory lines: quantity available ≥ quantity sold (P7) — error names the product and shortfall in owner language |
 | V6 | **currency is NGN** — v1 invoices are NGN-only (§9 decision #2); FX receipts still supported (§5.3) |
-| V7 | zero-total invoices blocked (min total 1 kobo) — a ₦0 "invoice" is a delivery note, not a receivable |
+| V7 | zero-total invoices **allowed with a confirm-warning** ("This invoice totals ₦0 — record as a free sample/giveaway?"). Ledger effect: no AR, revenue, or VAT lines (all zero); inventory-tracked lines still post **Dr COGS / Cr Inventory at current WAC**, so giveaways show their true cost on the P&L. If no inventory lines, the invoice posts **no journal entry** (`journal_entry_id` stays NULL — the document is the paper trail). Status settles to `paid` immediately (balance = 0). Advisor note: deemed-supply VAT on free goods, where applicable, is an Advisor Mode journal — the engine does not presume it |
 
 Amounts (`net_kobo`, `vat_kobo`) are computed and frozen at posting per Spec 01 §6.1/§8 — the stored invoice always foots against its own PDF forever, regardless of later rate changes.
 
@@ -139,7 +139,7 @@ All deltas are additive; no existing template, trigger, or invariant changes.
 6. **SMTP email send deferred to Phase 2**; v1 is mailto. (§7)
 7. **Receipt numbers live on `payments`** (no separate receipts table) — a receipt is a rendering of a payment, not an entity. (§5.5, §8.1)
 8. **"Move payment to deposit"** as the guided alternative when voiding a paid invoice — void + repost mechanics preserve full history. (§6)
-9. ⏳ **Zero-total invoices blocked** (V7) — **PENDING: review response was ambiguous (2026-07-03); confirm at next session.** Options on the table: (a) keep the block as specified, or (b) allow zero-total invoices so free samples/promotional stock get a paper trail — in which case V7 becomes a confirm-warning, and inventory-tracked lines still post COGS at WAC (Dr COGS / Cr Inventory) with zero revenue, so the giveaway shows its true cost on the P&L. (§4)
+9. ~~Zero-total invoices blocked~~ **RESOLVED 2026-07-03: allowed**, for the free-samples/promotional-stock paper trail. V7 is now a confirm-warning; inventory-tracked lines post COGS at WAC with zero revenue (true giveaway cost visible on the P&L); no-inventory zero invoices post no journal entry; deemed-supply VAT, where applicable, is an advisor journal. Treatment is final — see V7 (§4) for the normative wording. (§4)
 10. **WHT helper offers preset chips but never auto-computes silently** — the recorded WHT is always what the customer actually withheld. (§5.1)
 
 ---

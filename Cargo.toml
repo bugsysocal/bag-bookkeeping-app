@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/ledger-core"]
+# src-tauri joins the workspace when the app shell is scaffolded (after toolchain install).
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"

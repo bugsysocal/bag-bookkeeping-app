@@ -1,0 +1,10 @@
+[package]
+name = "ledger-core"
+version.workspace = true
+edition.workspace = true
+description = "LedgerOne accounting core: schema, integrity triggers, posting engine. UI-independent; every ledger write flows through this crate (Spec 01 P2)."
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+ulid = "1"
+thiserror = "1"

@@ -1,7 +1,23 @@
 {
   "permissions": {
     "allow": [
-      "WebSearch"
+      "WebSearch",
+      "PowerShell(cargo --version)",
+      "PowerShell(rustc --version)",
+      "PowerShell(node --version)",
+      "PowerShell(npm --version)",
+      "PowerShell(Test-Path \"$env:USERPROFILE\\\\.cargo\\\\bin\\\\cargo.exe\"; Test-Path \"$env:ProgramFiles\\\\nodejs\\\\node.exe\"; \\(Get-Command winget -ErrorAction SilentlyContinue\\) -ne $null)",
+      "PowerShell(winget install --id Rustlang.Rustup --silent --accept-package-agreements --accept-source-agreements)",
+      "PowerShell(winget install --id Microsoft.VisualStudio.2022.BuildTools --silent --accept-package-agreements --accept-source-agreements --override \"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended\")",
+      "PowerShell(& \"$env:USERPROFILE\\\\.cargo\\\\bin\\\\cargo.exe\" test --workspace 2>&1 | Out-String)",
+      "PowerShell(& \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\Installer\\\\setup.exe\" modify --installPath \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\" --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --quiet --wait --norestart | Out-String)",
+      "PowerShell($out = Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\bmop0269n.output\" -Tail 3; $out; Test-Path \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostarm64\\\\arm64\\\\link.exe\")",
+      "PowerShell(Get-Content \"$env:TEMP\\\\dd_installer_20260704000939.log\" -Tail 40)",
+      "PowerShell(winget install --id Microsoft.VisualStudio.2022.BuildTools --force --accept-package-agreements --accept-source-agreements --override \"--quiet --wait --norestart --add Microsoft.VisualStudio.Component.VC.Tools.ARM64\")",
+      "PowerShell(Test-Path \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostarm64\\\\arm64\\\\link.exe\"; Test-Path \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostarm64\\\\arm64\\\\cl.exe\")",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\brlcjyjtx.output\" | Select-String -Pattern 'error|warning: unused|test result|failed|passed' | Select-Object -First 30 | ForEach-Object { $_.Line })",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\b4j3mk20k.output\" | Select-String -Pattern 'Compiling ledger|Finished|Running|test result|running \\\\d+' | ForEach-Object { $_.Line.Trim\\(\\) })",
+      "PowerShell(git add -A)"
     ]
   }
 }

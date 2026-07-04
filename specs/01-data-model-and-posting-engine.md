@@ -1,5 +1,6 @@
 # Specification 01 — Data Model & Posting Engine
-**Project:** LedgerOne (placeholder) · **Covers:** Planning doc §5.2, §5.3 · **Status:** DRAFT v0.2 (structurally approved; tax rules updated to Nigeria Tax Act 2025 / WHT Regulations 2024, verified 2026-07-03)
+**Project:** LedgerOne (placeholder) · **Covers:** Planning doc §5.2, §5.3 · **Status:** APPROVED v0.3
+**Amendment history:** v0.2 — tax rules updated to NTA 2025 / WHT Regs 2024 (verified 2026-07-03). v0.3 — reconciliation shape reworked per approved Spec 04 #10 (`state` column + `reconciliation_matches` join table for 1:N/N:1); additive columns from Specs 02–04 (`fiscal_year_start_month`, `business_type`, `writeoff_limit_kobo`, invoice/payment columns per Spec 03 §8) live in their owning specs.
 **Stack context:** Tauri + Rust backend + local SQLite (rusqlite). All posting logic lives in Rust; the webview UI never touches the database directly.
 
 ---
@@ -336,19 +337,38 @@ CREATE TABLE reconciliations (
   statement_date         TEXT NOT NULL,
   statement_balance_kobo INTEGER NOT NULL,
   status                 TEXT NOT NULL DEFAULT 'in_progress'
-                         CHECK (status IN ('in_progress','completed')),
+                         CHECK (status IN ('in_progress','completed','completed_with_exceptions')),
+                         -- completed_with_exceptions: unresolved needs-review lines carry
+                         -- forward to the next session (Spec 04 §7.5)
   completed_at           TEXT,
   created_at             TEXT NOT NULL
 );
 
 CREATE TABLE reconciliation_lines (                      -- one row per imported statement line
+  -- Shape per approved Spec 04 #10 (supersedes the original single-matched_line_id sketch):
+  -- a workflow state machine on the statement line, incl. the needs-review quarantine (Spec 04 §7.5)
   id                TEXT PRIMARY KEY,
   reconciliation_id TEXT NOT NULL REFERENCES reconciliations(id),
   stmt_date         TEXT NOT NULL,
-  stmt_description  TEXT,
+  stmt_description  TEXT,                                -- verbatim from import; matching evidence, never rewritten
   stmt_amount_kobo  INTEGER NOT NULL,                    -- signed: + credit to bank, − debit
-  matched_line_id   TEXT REFERENCES journal_lines(id),   -- NULL = unmatched (prompts entry creation)
-  match_kind        TEXT CHECK (match_kind IN ('auto','manual','created'))
+  state             TEXT NOT NULL DEFAULT 'unmatched' CHECK (state IN
+                    ('unmatched','matched','entry_created','needs_review','written_off','import_error')),
+  match_kind        TEXT CHECK (match_kind IN ('auto','manual','created')),
+  import_hash       TEXT NOT NULL,                       -- dedup on re-import (Spec 04 §6.3)
+  review_note       TEXT,                                -- mandatory when needs_review; append-only thread
+  flagged_by        TEXT REFERENCES users(id),
+  flagged_at        TEXT,
+  resolved_by       TEXT REFERENCES users(id),
+  resolved_at       TEXT,
+  resolution        TEXT CHECK (resolution IN ('matched','entry_created','written_off','import_error')),
+  carried_from_id   TEXT REFERENCES reconciliation_lines(id)  -- needs-review carry-forward chain
+);
+
+CREATE TABLE reconciliation_matches (                    -- 1:N and N:1, sum-exact (Spec 04 §7.3)
+  reconciliation_line_id TEXT NOT NULL REFERENCES reconciliation_lines(id),
+  journal_line_id        TEXT NOT NULL REFERENCES journal_lines(id),
+  PRIMARY KEY (reconciliation_line_id, journal_line_id)
 );
 -- Reconciliation lock: completing a reconciliation stamps bank_accounts.last_reconciled_date;
 -- posting-engine precondition P6 (§6.0) rejects new/reversal entries touching that bank
