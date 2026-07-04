@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LedgerOne</title>
+  <style>
+    /* Placeholder shell — real UI lands with the Spec 02 wizard + Spec 07 dashboard. */
+    body { font-family: "Segoe UI", system-ui, sans-serif; margin: 0; background: #f7f6f2; color: #1d2733; }
+    header { background: #14532d; color: #fff; padding: 14px 24px; font-size: 18px; font-weight: 600; }
+    main { max-width: 720px; margin: 32px auto; padding: 0 16px; }
+    .card { background: #fff; border-radius: 10px; padding: 20px 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    button { background: #14532d; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-size: 15px; cursor: pointer; }
+    button:disabled { opacity: .5; }
+    .error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 12px 16px; color: #7f1d1d; margin-top: 12px; white-space: pre-wrap; }
+    .num { font-variant-numeric: tabular-nums; font-size: 26px; font-weight: 700; }
+    .muted { color: #64748b; font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    td { padding: 6px 0; border-bottom: 1px solid #eef2f7; }
+    td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <header>LedgerOne <span style="font-weight:400;opacity:.75">— your books, always balanced</span></header>
+  <main>
+    <div class="card" id="setup">
+      <h3>Getting started</h3>
+      <p class="muted">Placeholder shell: proves the engine end-to-end. The real setup wizard (Spec 02) replaces this screen.</p>
+      <button id="btn-demo">Create a demo business</button>
+      <div id="err"></div>
+    </div>
+    <div class="card" id="dash" style="display:none">
+      <h3 id="dash-name"></h3>
+      <div class="muted">Cash today</div>
+      <div class="num" id="cash"></div>
+      <table id="accounts"></table>
+      <table style="margin-top:16px">
+        <tr><td>Who owes me</td><td id="ar"></td></tr>
+        <tr><td>What I owe <span class="muted" id="tax-note"></span></td><td id="ap"></td></tr>
+        <tr><td>Profit this month</td><td id="profit"></td></tr>
+      </table>
+    </div>
+  </main>
+  <script>
+    const invoke = window.__TAURI__.core.invoke;
+    const naira = k => "₦" + (k / 100).toLocaleString("en-NG", { minimumFractionDigits: 2 });
+    const showErr = e => {
+      // CmdError envelope: message is owner-facing; detail is advisor-only (hidden here).
+      document.getElementById("err").innerHTML =
+        `<div class="error">${(e && e.message) || "Something went wrong. Please try again."}</div>`;
+    };
+
+    document.getElementById("btn-demo").onclick = async () => {
+      document.getElementById("err").innerHTML = "";
+      try {
+        const co = await invoke("create_company", { input: {
+          name: "Demo Traders Ltd", vat_registered: true, vat_exempt: false,
+          cit_exempt: true, inventory_enabled: false, fiscal_year_start_month: 1,
+          business_type: "trading", tin: null, invoice_start: null, license_key: "LO-DEMO-0000"
+        }});
+        const bank = await invoke("add_bank_account", {
+          companyId: co.id, label: "GTBank Current", kind: "bank", currency: "NGN" });
+        await invoke("add_bank_account", {
+          companyId: co.id, label: "Petty Cash", kind: "cash", currency: "NGN" });
+        await invoke("record_drawing", {
+          companyId: co.id, bankAccountId: bank, date: new Date().toISOString().slice(0,10),
+          amountKobo: 250000000, out: false, confirmSoftClose: false });
+        await refresh(co);
+      } catch (e) { showErr(e); }
+    };
+
+    async function refresh(co) {
+      const d = await invoke("dashboard", { companyId: co.id });
+      document.getElementById("setup").style.display = "none";
+      const dash = document.getElementById("dash");
+      dash.style.display = "";
+      document.getElementById("dash-name").textContent = co.name;
+      document.getElementById("cash").textContent = naira(d.cash_total_kobo);
+      document.getElementById("accounts").innerHTML = d.cash_accounts
+        .map(a => `<tr><td>${a.label}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("");
+      document.getElementById("ar").textContent = naira(d.who_owes_me_kobo);
+      document.getElementById("ap").textContent = naira(d.what_i_owe_kobo);
+      document.getElementById("tax-note").textContent = d.unremitted_tax_kobo > 0
+        ? `(incl. ${naira(d.unremitted_tax_kobo)} tax collected, not yet remitted)` : "";
+      document.getElementById("profit").textContent = naira(d.profit_this_month_kobo);
+    }
+
+    // Reopen path: if a company already exists, go straight to the dashboard.
+    invoke("list_companies").then(cs => { if (cs.length) refresh(cs[0]); }).catch(() => {});
+  </script>
+</body>
+</html>

@@ -5,6 +5,8 @@
 //! invariants via triggers (Spec 01 §4); this crate's posting functions are the
 //! friendly first line of validation, not the only line.
 
+pub use rusqlite; // single rusqlite version for all downstream crates
+
 pub mod db;
 pub mod engine;
 pub mod ids;

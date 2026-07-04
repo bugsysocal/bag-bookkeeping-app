@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Main window: core IPC only. No shell, fs, or network capabilities — the frontend talks to ledger-core through commands and nothing else.","local":true,"windows":["main"],"permissions":["core:default"]}}
