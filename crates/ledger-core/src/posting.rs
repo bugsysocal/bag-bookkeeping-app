@@ -3,9 +3,9 @@
 //! balance/hard-close triggers. Any RAISE(ABORT) rolls the whole event back.
 //! An entry commits balanced or it does not commit.
 //!
-//! `post_entry` is the shared plumbing every Spec 01 §6 template function
-//! (postInvoice, postPayment, …) will drive. Those templates land next; this
-//! function plus the triggers is the invariant core they all inherit.
+//! `post_entry_in` is the shared plumbing every Spec 01 §6 template function
+//! (engine.rs) drives inside its own transaction; `post_entry` is the
+//! standalone wrapper for callers without one.
 
 use crate::ids::{new_id, now_iso};
 use rusqlite::{params, Connection, TransactionBehavior};
@@ -18,6 +18,9 @@ pub struct LineSpec {
     /// Required on AR/AP lines (P8) — template functions enforce; plumbing carries it.
     pub contact_id: Option<String>,
     pub memo: Option<String>,
+    /// FX metadata for foreign-currency bank lines (Spec 01 §3.6).
+    pub fx_currency: Option<String>,
+    pub fx_amount_kobo: Option<i64>,
 }
 
 impl LineSpec {
@@ -27,7 +30,15 @@ impl LineSpec {
             amount_kobo,
             contact_id: None,
             memo: None,
+            fx_currency: None,
+            fx_amount_kobo: None,
         }
+    }
+
+    pub fn with_contact(account_id: &str, amount_kobo: i64, contact_id: &str) -> Self {
+        let mut l = Self::new(account_id, amount_kobo);
+        l.contact_id = Some(contact_id.to_string());
+        l
     }
 }
 
@@ -40,9 +51,11 @@ pub enum PostError {
     Db(#[from] rusqlite::Error),
 }
 
-/// Post a balanced journal entry atomically. Returns the new entry id.
-pub fn post_entry(
-    conn: &mut Connection,
+/// Post a balanced journal entry inside the caller's open transaction
+/// (`Transaction` derefs to `Connection`). Returns the new entry id.
+/// The caller owns commit/rollback — document rows and the entry land together (P1).
+pub fn post_entry_in(
+    conn: &Connection,
     company_id: &str,
     entry_date: &str,
     memo: &str,
@@ -72,12 +85,10 @@ pub fn post_entry(
         ));
     }
 
-    // P1: one transaction — entry, lines, and the validating flip commit together or not at all.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let entry_id = new_id();
     let now = now_iso();
 
-    tx.execute(
+    conn.execute(
         "INSERT INTO journal_entries
            (id, company_id, entry_date, memo, source_type, source_id, is_posted, created_by, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
@@ -85,10 +96,10 @@ pub fn post_entry(
     )?;
 
     for (i, line) in lines.iter().enumerate() {
-        tx.execute(
+        conn.execute(
             "INSERT INTO journal_lines
-               (id, entry_id, line_no, account_id, amount_kobo, contact_id, memo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               (id, entry_id, line_no, account_id, amount_kobo, contact_id, memo, fx_currency, fx_amount_kobo)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 new_id(),
                 entry_id,
@@ -96,17 +107,35 @@ pub fn post_entry(
                 line.account_id,
                 line.amount_kobo,
                 line.contact_id,
-                line.memo
+                line.memo,
+                line.fx_currency,
+                line.fx_amount_kobo
             ],
         )?;
     }
 
     // The flip that fires T1 (balance, >= 2 lines) and T5 (hard close).
-    tx.execute(
+    conn.execute(
         "UPDATE journal_entries SET is_posted = 1, posted_at = ?2 WHERE id = ?1",
         params![entry_id, now],
     )?;
 
-    tx.commit()?;
     Ok(entry_id)
+}
+
+/// Standalone posting: opens and commits its own transaction (P1).
+pub fn post_entry(
+    conn: &mut Connection,
+    company_id: &str,
+    entry_date: &str,
+    memo: &str,
+    source_type: &str,
+    source_id: Option<&str>,
+    created_by: Option<&str>,
+    lines: &[LineSpec],
+) -> Result<String, PostError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let id = post_entry_in(&tx, company_id, entry_date, memo, source_type, source_id, created_by, lines)?;
+    tx.commit()?;
+    Ok(id)
 }

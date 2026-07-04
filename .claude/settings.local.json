@@ -17,7 +17,11 @@
       "PowerShell(Test-Path \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostarm64\\\\arm64\\\\link.exe\"; Test-Path \"${env:ProgramFiles\\(x86\\)}\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\VC\\\\Tools\\\\MSVC\\\\14.44.35207\\\\bin\\\\Hostarm64\\\\arm64\\\\cl.exe\")",
       "PowerShell(Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\brlcjyjtx.output\" | Select-String -Pattern 'error|warning: unused|test result|failed|passed' | Select-Object -First 30 | ForEach-Object { $_.Line })",
       "PowerShell(Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\b4j3mk20k.output\" | Select-String -Pattern 'Compiling ledger|Finished|Running|test result|running \\\\d+' | ForEach-Object { $_.Line.Trim\\(\\) })",
-      "PowerShell(git add -A)"
+      "PowerShell(git add -A)",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\bk95t3zt6.output\" | Select-String -Pattern '^error|^warning: unused|-->' | Select-Object -First 40 | ForEach-Object { $_.Line })",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\bqc43mdzo.output\" | Select-String -Pattern '^error\\\\[|^error:|^\\\\s+-->' | Select-Object -First 40 | ForEach-Object { $_.Line.Trim\\(\\) })",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\b4rakakkx.output\" | Select-String -Pattern 'test result|FAILED|panicked|^error|failures:' -Context 0,2 | Select-Object -First 25 | ForEach-Object { $_.Line.Trim\\(\\); $_.Context.PostContext | ForEach-Object { \"  $_\".TrimEnd\\(\\) } })",
+      "PowerShell(& \"$env:USERPROFILE\\\\.cargo\\\\bin\\\\cargo.exe\" test --workspace 2>&1 | Select-String -Pattern 'test result|running \\\\d+|FAILED|panicked' | ForEach-Object { $_.Line.Trim\\(\\) })"
     ]
   }
 }

@@ -6,8 +6,12 @@
 //! friendly first line of validation, not the only line.
 
 pub mod db;
+pub mod engine;
 pub mod ids;
+pub mod money;
 pub mod posting;
+pub mod seed;
 
 pub use db::open;
-pub use posting::{post_entry, LineSpec, PostError};
+pub use engine::{EngineError, PostCtx};
+pub use posting::{post_entry, post_entry_in, LineSpec, PostError};
