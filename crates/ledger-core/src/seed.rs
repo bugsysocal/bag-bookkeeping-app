@@ -119,6 +119,13 @@ impl Default for CompanyConfig {
 /// Create a company with full seed, atomically (Spec 02 W1). Returns company id.
 pub fn create_company(conn: &mut Connection, cfg: &CompanyConfig) -> Result<String, PostError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let id = create_company_in(&tx, cfg)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Company + seed inside the caller's open transaction (wizard composition).
+pub fn create_company_in(tx: &Connection, cfg: &CompanyConfig) -> Result<String, PostError> {
     let company_id = new_id();
     let now = now_iso();
 
@@ -176,7 +183,6 @@ pub fn create_company(conn: &mut Connection, cfg: &CompanyConfig) -> Result<Stri
         )?;
     }
 
-    tx.commit()?;
     Ok(company_id)
 }
 
@@ -191,6 +197,19 @@ pub fn add_bank_account(
     currency: &str,
 ) -> Result<String, PostError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (bank_id, _) = add_bank_account_in(&tx, company_id, label, kind, currency)?;
+    tx.commit()?;
+    Ok(bank_id)
+}
+
+/// Bank/cash account inside the caller's transaction. Returns (bank_account_id, coa_account_id).
+pub fn add_bank_account_in(
+    tx: &Connection,
+    company_id: &str,
+    label: &str,
+    kind: &str,
+    currency: &str,
+) -> Result<(String, String), PostError> {
     let max_code: Option<String> = tx
         .query_row(
             "SELECT MAX(code) FROM accounts WHERE company_id = ?1 AND code >= '1010' AND code < '1100'",
@@ -224,6 +243,151 @@ pub fn add_bank_account(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![bank_id, company_id, account_id, label, kind, currency],
     )?;
+    Ok((bank_id, account_id))
+}
+
+// ===== Full wizard commit (Spec 02 W1 + Spec 10 §5b EULA record) =====
+
+#[derive(Debug, Clone)]
+pub struct SetupBank {
+    pub label: String,
+    pub kind: String, // 'bank' | 'cash' | 'pos_wallet' | 'domiciliary'
+    pub currency: String,
+    pub opening_balance_kobo: i64, // may be negative (overdraft)
+}
+
+#[derive(Debug, Clone)]
+pub struct SetupContact {
+    pub name: String,
+    pub phone: Option<String>,
+    pub amount_kobo: i64, // owed to us (customers) / owed by us (suppliers)
+}
+
+#[derive(Debug, Clone)]
+pub struct FullSetup {
+    pub company: CompanyConfig,
+    pub banks: Vec<SetupBank>,
+    pub customers_owing: Vec<SetupContact>,
+    pub suppliers_owed: Vec<SetupContact>,
+    pub opening_date: String,
+    pub owner_name: String,
+    pub staff_name: Option<String>,
+    /// Advisor Mode PIN, 6 digits (Spec 02 §5.8) — argon2-hashed, stored on the owner row.
+    pub advisor_pin: String,
+    /// Accepted EULA version (Spec 10 §5b) — acceptance is the gate; recorded append-only.
+    pub eula_version: String,
+}
+
+/// The whole wizard in ONE transaction: company, COA, banks, contacts, opening
+/// journal (OBE plug), users, EULA acceptance. Cancel = nothing exists (W1).
+pub fn create_company_full(conn: &mut Connection, s: &FullSetup) -> Result<String, PostError> {
+    if s.banks.is_empty() {
+        return Err(PostError::Validation("at least one bank or cash account is needed".into()));
+    }
+    if s.owner_name.trim().is_empty() {
+        return Err(PostError::Validation("the owner's name is needed".into()));
+    }
+    if s.advisor_pin.len() != 6 || !s.advisor_pin.chars().all(|c| c.is_ascii_digit()) {
+        return Err(PostError::Validation("the advisor PIN must be exactly 6 digits".into()));
+    }
+    if s.eula_version.trim().is_empty() {
+        return Err(PostError::Validation("the agreement must be accepted first".into()));
+    }
+    for c in s.customers_owing.iter().chain(&s.suppliers_owed) {
+        if c.name.trim().is_empty() || c.amount_kobo <= 0 {
+            return Err(PostError::Validation("each opening balance needs a name and a positive amount".into()));
+        }
+    }
+
+    let pin_hash = {
+        use argon2::password_hash::{rand_core::OsRng, SaltString};
+        use argon2::{Argon2, PasswordHasher};
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(s.advisor_pin.as_bytes(), &salt)
+            .map_err(|e| PostError::Validation(format!("PIN hashing failed: {e}")))?
+            .to_string()
+    };
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let company_id = create_company_in(&tx, &s.company)?;
+    let now = now_iso();
+
+    let sys_acct = |key: &str| -> Result<String, PostError> {
+        Ok(tx.query_row(
+            "SELECT id FROM accounts WHERE company_id = ?1 AND system_key = ?2",
+            params![company_id, key],
+            |r| r.get(0),
+        )?)
+    };
+
+    // Banks + opening lines.
+    let mut je_lines: Vec<crate::posting::LineSpec> = Vec::new();
+    for b in &s.banks {
+        let (_bank_id, coa_id) = add_bank_account_in(&tx, &company_id, &b.label, &b.kind, &b.currency)?;
+        if b.opening_balance_kobo != 0 {
+            je_lines.push(crate::posting::LineSpec::new(&coa_id, b.opening_balance_kobo));
+        }
+    }
+
+    // Contacts + per-contact AR/AP opening lines (P8: subledger dimension from day one).
+    let ar = sys_acct("AR")?;
+    let ap = sys_acct("AP")?;
+    let mut mk_contact = |name: &str, phone: &Option<String>, kind: &str| -> Result<String, PostError> {
+        let id = new_id();
+        tx.execute(
+            "INSERT INTO contacts (id, company_id, kind, name, phone, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, company_id, kind, name.trim(), phone, now],
+        )?;
+        Ok(id)
+    };
+    for c in &s.customers_owing {
+        let cid = mk_contact(&c.name, &c.phone, "customer")?;
+        je_lines.push(crate::posting::LineSpec::with_contact(&ar, c.amount_kobo, &cid));
+    }
+    for c in &s.suppliers_owed {
+        let cid = mk_contact(&c.name, &c.phone, "supplier")?;
+        je_lines.push(crate::posting::LineSpec::with_contact(&ap, -c.amount_kobo, &cid));
+    }
+
+    // OBE plug — balanced by construction (Spec 02 §5.6).
+    let sum: i64 = je_lines.iter().map(|l| l.amount_kobo).sum();
+    if sum != 0 {
+        je_lines.push(crate::posting::LineSpec::new(&sys_acct("OPENING_BALANCE_EQUITY")?, -sum));
+    }
+    if je_lines.len() >= 2 {
+        crate::posting::post_entry_in(
+            &tx, &company_id, &s.opening_date, "Opening balances at setup",
+            "opening_balance", None, None, &je_lines,
+        )?;
+    }
+
+    // Users: owner (carries the argon2 advisor-PIN hash), optional accounts officer.
+    let owner_id = new_id();
+    tx.execute(
+        "INSERT INTO users (id, company_id, name, role, pin_hash, created_at)
+         VALUES (?1, ?2, ?3, 'owner', ?4, ?5)",
+        params![owner_id, company_id, s.owner_name.trim(), pin_hash, now],
+    )?;
+    if let Some(staff) = &s.staff_name {
+        if !staff.trim().is_empty() {
+            tx.execute(
+                "INSERT INTO users (id, company_id, name, role, created_at)
+                 VALUES (?1, ?2, ?3, 'staff', ?4)",
+                params![new_id(), company_id, staff.trim(), now],
+            )?;
+        }
+    }
+
+    // EULA acceptance: append-only evidence (Spec 10 §5b).
+    tx.execute(
+        "INSERT INTO audit_log (id, company_id, user_id, action, entity_type, entity_id, detail_json, created_at)
+         VALUES (?1, ?2, ?3, 'eula.accepted', 'company', ?2, ?4, ?5)",
+        params![new_id(), company_id, owner_id,
+                format!("{{\"version\":\"{}\"}}", s.eula_version), now],
+    )?;
+
     tx.commit()?;
-    Ok(bank_id)
+    Ok(company_id)
 }

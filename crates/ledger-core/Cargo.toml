@@ -8,3 +8,4 @@ description = "LedgerOne accounting core: schema, integrity triggers, posting en
 rusqlite = { version = "0.31", features = ["bundled"] }
 ulid = "1"
 thiserror = "1"
+argon2 = { version = "0.5", features = ["std"] }

@@ -1,91 +1,332 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>LedgerOne</title>
-  <style>
-    /* Placeholder shell — real UI lands with the Spec 02 wizard + Spec 07 dashboard. */
-    body { font-family: "Segoe UI", system-ui, sans-serif; margin: 0; background: #f7f6f2; color: #1d2733; }
-    header { background: #14532d; color: #fff; padding: 14px 24px; font-size: 18px; font-weight: 600; }
-    main { max-width: 720px; margin: 32px auto; padding: 0 16px; }
-    .card { background: #fff; border-radius: 10px; padding: 20px 24px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-    button { background: #14532d; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px; font-size: 15px; cursor: pointer; }
-    button:disabled { opacity: .5; }
-    .error { background: #fef2f2; border: 1px solid #fecaca; border-radius: 8px; padding: 12px 16px; color: #7f1d1d; margin-top: 12px; white-space: pre-wrap; }
-    .num { font-variant-numeric: tabular-nums; font-size: 26px; font-weight: 700; }
-    .muted { color: #64748b; font-size: 13px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-    td { padding: 6px 0; border-bottom: 1px solid #eef2f7; }
-    td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
-  </style>
+<meta charset="UTF-8" />
+<title>LedgerOne</title>
+<style>
+  /* Owner-language wizard (Spec 02 §5) behind the EULA gate (Spec 10 §5b).
+     Lexicon rule (Spec 07 §4): no accounting vocabulary anywhere on these screens. */
+  :root { --green:#14532d; --ink:#1d2733; --mut:#64748b; --line:#e5e7eb; }
+  body { font-family:"Segoe UI",system-ui,sans-serif; margin:0; background:#f7f6f2; color:var(--ink); }
+  header { background:var(--green); color:#fff; padding:14px 24px; font-size:18px; font-weight:600; }
+  main { max-width:760px; margin:28px auto; padding:0 16px; }
+  .card { background:#fff; border-radius:10px; padding:22px 26px; margin-bottom:16px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  h3 { margin:0 0 4px; } .mut { color:var(--mut); font-size:13px; }
+  label { display:block; margin:12px 0 4px; font-weight:600; font-size:14px; }
+  input[type=text], input[type=date], select { width:100%; box-sizing:border-box; padding:9px 10px; border:1px solid var(--line); border-radius:8px; font-size:15px; }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
+  button { background:var(--green); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:15px; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--green); border:1px solid var(--green); }
+  button:disabled { opacity:.45; cursor:default; }
+  .nav { display:flex; justify-content:space-between; margin-top:20px; }
+  .error { background:#fef2f2; border:1px solid #fecaca; border-radius:8px; padding:12px 16px; color:#7f1d1d; margin-top:12px; }
+  .ok { background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px; padding:10px 14px; margin-top:10px; font-size:14px; }
+  .radio label { font-weight:400; margin:6px 0; } .radio input { margin-right:8px; }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  td, th { padding:6px 4px; border-bottom:1px solid #eef2f7; text-align:left; font-size:14px; }
+  td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  .steps { font-size:12px; color:var(--mut); margin-bottom:10px; letter-spacing:.4px; }
+  .eula { max-height:340px; overflow-y:auto; border:1px solid var(--line); border-radius:8px; padding:14px 18px; font-size:13px; line-height:1.55; background:#fafafa; }
+  .num { font-variant-numeric:tabular-nums; font-size:26px; font-weight:700; }
+</style>
 </head>
 <body>
-  <header>LedgerOne <span style="font-weight:400;opacity:.75">— your books, always balanced</span></header>
-  <main>
-    <div class="card" id="setup">
-      <h3>Getting started</h3>
-      <p class="muted">Placeholder shell: proves the engine end-to-end. The real setup wizard (Spec 02) replaces this screen.</p>
-      <button id="btn-demo">Create a demo business</button>
-      <div id="err"></div>
-    </div>
-    <div class="card" id="dash" style="display:none">
-      <h3 id="dash-name"></h3>
-      <div class="muted">Cash today</div>
-      <div class="num" id="cash"></div>
-      <table id="accounts"></table>
-      <table style="margin-top:16px">
-        <tr><td>Who owes me</td><td id="ar"></td></tr>
-        <tr><td>What I owe <span class="muted" id="tax-note"></span></td><td id="ap"></td></tr>
-        <tr><td>Profit this month</td><td id="profit"></td></tr>
-      </table>
-    </div>
-  </main>
-  <script>
-    const invoke = window.__TAURI__.core.invoke;
-    const naira = k => "₦" + (k / 100).toLocaleString("en-NG", { minimumFractionDigits: 2 });
-    const showErr = e => {
-      // CmdError envelope: message is owner-facing; detail is advisor-only (hidden here).
-      document.getElementById("err").innerHTML =
-        `<div class="error">${(e && e.message) || "Something went wrong. Please try again."}</div>`;
-    };
+<header>LedgerOne <span style="font-weight:400;opacity:.75">— your books, always balanced</span></header>
+<main id="main"></main>
+<script>
+const invoke = window.__TAURI__.core.invoke;
+const EULA_VERSION = "EULA-DRAFT-1";
+const naira = k => "₦" + (k/100).toLocaleString("en-NG",{minimumFractionDigits:2});
+const kobo = s => { const n = parseFloat(String(s||"0").replace(/[₦,\s]/g,"")); return isNaN(n) ? 0 : Math.round(n*100); };
+const esc = s => String(s??"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-    document.getElementById("btn-demo").onclick = async () => {
-      document.getElementById("err").innerHTML = "";
-      try {
-        const co = await invoke("create_company", { input: {
-          name: "Demo Traders Ltd", vat_registered: true, vat_exempt: false,
-          cit_exempt: true, inventory_enabled: false, fiscal_year_start_month: 1,
-          business_type: "trading", tin: null, invoice_start: null, license_key: "LO-DEMO-0000"
-        }});
-        const bank = await invoke("add_bank_account", {
-          companyId: co.id, label: "GTBank Current", kind: "bank", currency: "NGN" });
-        await invoke("add_bank_account", {
-          companyId: co.id, label: "Petty Cash", kind: "cash", currency: "NGN" });
-        await invoke("record_drawing", {
-          companyId: co.id, bankAccountId: bank, date: new Date().toISOString().slice(0,10),
-          amountKobo: 250000000, out: false, confirmSoftClose: false });
-        await refresh(co);
-      } catch (e) { showErr(e); }
-    };
+// Wizard state (Spec 02 §5) — committed atomically at the end, nothing before.
+const S = {
+  name:"", business_type:"trading", tin:"", fiscal_month:1, license_key:"",
+  turnover:"", assets_small:null, professional:null, vat_answer:"",
+  inventory:false,
+  banks:[{label:"GTBank Current",kind:"bank",currency:"NGN",bal:""},{label:"Petty Cash",kind:"cash",currency:"NGN",bal:""}],
+  customers:[], suppliers:[], opening_date:new Date().toISOString().slice(0,10),
+  invoice_start:"1", owner:"", staff:"", pin:"", pin2:"",
+};
+// Spec 02 §5.2 derivation — the two reliefs are independent and never conflated.
+const derive = () => {
+  const P = S.professional === true;
+  const vat_exempt = S.turnover==="under50" && !P;
+  const cit_exempt = (S.turnover!=="over100") && S.assets_small===true && !P;
+  const vat_registered = S.vat_answer==="yes" ? true : S.vat_answer==="no" ? false : !vat_exempt;
+  return { vat_exempt, cit_exempt, vat_registered };
+};
 
-    async function refresh(co) {
-      const d = await invoke("dashboard", { companyId: co.id });
-      document.getElementById("setup").style.display = "none";
-      const dash = document.getElementById("dash");
-      dash.style.display = "";
-      document.getElementById("dash-name").textContent = co.name;
-      document.getElementById("cash").textContent = naira(d.cash_total_kobo);
-      document.getElementById("accounts").innerHTML = d.cash_accounts
-        .map(a => `<tr><td>${a.label}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("");
-      document.getElementById("ar").textContent = naira(d.who_owes_me_kobo);
-      document.getElementById("ap").textContent = naira(d.what_i_owe_kobo);
-      document.getElementById("tax-note").textContent = d.unremitted_tax_kobo > 0
-        ? `(incl. ${naira(d.unremitted_tax_kobo)} tax collected, not yet remitted)` : "";
-      document.getElementById("profit").textContent = naira(d.profit_this_month_kobo);
+let step = 0;
+const el = id => document.getElementById(id);
+const err = e => { const b = el("err"); if (b) b.innerHTML =
+  `<div class="error">${esc((e&&e.message)||"Something went wrong. Please try again.")}</div>`; };
+
+const STEPS = [eulaStep, basicsStep, taxStep, stockStep, banksStep, owesStep, numberStep, peopleStep, reviewStep];
+function render(){ el("main") && (document.getElementById("main").innerHTML = ""); STEPS[step](); }
+function shell(title, sub, body, canBack=true, nextLabel="Continue"){
+  el("main").innerHTML = `<div class="card">
+    <div class="steps">STEP ${step} OF 8</div><h3>${title}</h3><div class="mut">${sub}</div>
+    ${body}<div id="err"></div>
+    <div class="nav">
+      <button class="ghost" id="back" ${canBack?"":"style='visibility:hidden'"}>Back</button>
+      <button id="next">${nextLabel}</button>
+    </div></div>`;
+  el("back").onclick = () => { step--; render(); };
+}
+
+// ── Step 0: EULA gate (Spec 10 §5b) — full text in docs/legal/EULA.md
+function eulaStep(){
+  el("main").innerHTML = `<div class="card">
+    <h3>Before you start</h3>
+    <div class="mut">Please read and accept this agreement. (Draft ${EULA_VERSION} — pending legal review.)</div>
+    <div class="eula">
+      <p><b>END USER LICENSE AGREEMENT AND DISCLAIMER</b> — between you and <b>Bolton Advisory Group</b> for the LedgerOne software.</p>
+      <p><b>1. License.</b> You may install and use LedgerOne for your own business record-keeping. No resale, sublicensing, or reverse engineering.</p>
+      <p><b>2. Your data is yours.</b> Everything you enter stays on your computer and belongs to you. We do not receive or access it. Optional features that send data elsewhere (like Google Sheets) stay off unless you turn them on.</p>
+      <p><b>3. No warranty of accuracy for calculated figures.</b> LedgerOne calculates totals, profit, VAT, withholding tax and other amounts from what <i>you</i> enter. We do not warrant any calculated figure is accurate or suitable for any purpose. Errors in input produce errors in output.</p>
+      <p><b>4. Check before you file.</b> You are solely responsible for verifying every figure and report before submitting anything to FIRS, any State revenue service, any lender, or any other party. Reports are working documents, not filings.</p>
+      <p><b>5. No professional relationship.</b> Using this software does not, by itself, make Bolton Advisory Group your accountant, tax adviser, auditor, or lawyer. Professional advice requires a separate written engagement.</p>
+      <p><b>6. Limitation of liability.</b> The software is provided "as is". To the maximum extent Nigerian law permits, we are not liable for indirect or consequential losses (including penalties or fines from filings), and our total liability is capped at the license fees you paid in the last 12 months, or ₦50,000 if none.</p>
+      <p><b>7–8.</b> Updates are your choice. Governed by the laws of the Federal Republic of Nigeria. Your acceptance is recorded, with date and version, in the software's tamper-evident activity log.</p>
+    </div>
+    <label style="font-weight:400;margin-top:14px"><input type="checkbox" id="agree" /> I have read and accept this agreement</label>
+    <div id="err"></div>
+    <div class="nav"><span></span><button id="next" disabled>I agree — set up my business</button></div></div>`;
+  el("agree").onchange = e => el("next").disabled = !e.target.checked;
+  el("next").onclick = () => { step = 1; render(); };
+}
+
+// ── Step 1: basics
+function basicsStep(){
+  shell("Your business","Just the essentials — everything can be changed later.",`
+    <label>Business name</label><input type="text" id="f-name" value="${esc(S.name)}" />
+    <div class="row"><div><label>What kind of business?</label>
+      <select id="f-type">
+        ${["trading|Buying & selling goods","services|Services","manufacturing|Making things","agency|Agency / commissions","mixed|A mix"]
+          .map(o=>{const [v,t]=o.split("|");return `<option value="${v}" ${S.business_type===v?"selected":""}>${t}</option>`}).join("")}
+      </select></div>
+      <div><label>When does your business year start?</label>
+      <select id="f-month">${["January","February","March","April","May","June","July","August","September","October","November","December"]
+        .map((m,i)=>`<option value="${i+1}" ${S.fiscal_month===i+1?"selected":""}>${m}</option>`).join("")}</select></div></div>
+    <div class="row"><div><label>Your FIRS TIN <span class="mut">(optional — add later if you don't have it handy)</span></label>
+      <input type="text" id="f-tin" value="${esc(S.tin)}" /></div>
+      <div><label>License key <span class="mut">(from your welcome letter)</span></label>
+      <input type="text" id="f-lic" value="${esc(S.license_key)}" placeholder="LO-…" /></div></div>`, false);
+  el("next").onclick = () => {
+    S.name = el("f-name").value.trim(); S.business_type = el("f-type").value;
+    S.fiscal_month = +el("f-month").value; S.tin = el("f-tin").value.trim(); S.license_key = el("f-lic").value.trim();
+    if (!S.name) return err({message:"Please enter your business name."});
+    step = 2; render();
+  };
+}
+
+// ── Step 2: the three tax questions + VAT registration (Spec 02 §5.2, owner language only)
+function taxStep(){
+  const d = derive();
+  shell("A few questions about size","Answer about your business — we handle the tax rules.",`
+    <label>Roughly how much does your business sell in a year?</label>
+    <div class="radio">
+      ${[["under50","Under ₦50 million"],["between","₦50 million – ₦100 million"],["over100","Over ₦100 million"]]
+        .map(([v,t])=>`<label><input type="radio" name="t" value="${v}" ${S.turnover===v?"checked":""}/>${t}</label>`).join("")}
+    </div>
+    <div id="q2" style="display:${S.turnover==="over100"?"none":"block"}">
+      <label>Is the total value of your business property — vehicles, equipment, machinery, buildings — under ₦250 million?</label>
+      <div class="radio">
+        ${[["yes","Yes"],["no","No"],["unsure","Not sure"]].map(([v,t])=>
+          `<label><input type="radio" name="a" value="${v}" ${S.assets_small===(v==="yes")&&S.assets_small!==null&&(v!=="unsure")?"checked":""}/>${t}</label>`).join("")}
+      </div></div>
+    <label>Is your business a professional practice — law, accountancy, consulting, engineering services, medical practice, or similar?</label>
+    <div class="radio">
+      ${[["yes","Yes"],["no","No"]].map(([v,t])=>
+        `<label><input type="radio" name="p" value="${v}" ${S.professional===(v==="yes")&&S.professional!==null?"checked":""}/>${t}</label>`).join("")}
+    </div>
+    <label>Are you registered for VAT with FIRS?</label>
+    <div class="radio">
+      ${[["yes","Yes"],["no","No"],["unsure","Not sure"]].map(([v,t])=>
+        `<label><input type="radio" name="v" value="${v}" ${S.vat_answer===v?"checked":""}/>${t}</label>`).join("")}
+    </div>
+    <div class="ok" id="summary" style="display:none"></div>`);
+  const upd = () => {
+    const t = document.querySelector("input[name=t]:checked"); const a = document.querySelector("input[name=a]:checked");
+    const p = document.querySelector("input[name=p]:checked"); const v = document.querySelector("input[name=v]:checked");
+    S.turnover = t? t.value : ""; el("q2").style.display = S.turnover==="over100" ? "none":"block";
+    S.assets_small = a ? (a.value==="yes") : null;             // "Not sure" ⇒ treated as No, advisor revisits
+    S.professional = p ? (p.value==="yes") : null;
+    S.vat_answer = v ? v.value : "";
+    if (S.turnover && S.professional!==null){
+      const d2 = derive();
+      const lines = [
+        d2.vat_registered ? "✓ You'll add 7.5% VAT to your invoices."
+                          : "✓ You won't add VAT to your invoices.",
+        d2.cit_exempt ? "✓ For payments to suppliers with a TIN, under ₦2 million a month, you won't need to hold back tax."
+                      : "• When paying some suppliers, you may need to hold back a small tax portion — LedgerOne handles the sums.",
+      ];
+      if (!d2.vat_registered && S.turnover!=="under50")
+        lines.push("⚠ Businesses selling above ₦50M must register for VAT with FIRS. LedgerOne will not add VAT to your invoices until your advisor switches this on.");
+      el("summary").style.display=""; el("summary").innerHTML = lines.map(esc).join("<br>");
     }
+  };
+  document.querySelectorAll("input[type=radio]").forEach(r => r.onchange = upd); upd();
+  el("next").onclick = () => {
+    if (!S.turnover) return err({message:"Please pick your yearly sales range."});
+    if (S.turnover!=="over100" && S.assets_small===null) return err({message:"Please answer the business property question."});
+    if (S.professional===null) return err({message:"Please answer the professional practice question."});
+    step = 3; render();
+  };
+}
 
-    // Reopen path: if a company already exists, go straight to the dashboard.
-    invoke("list_companies").then(cs => { if (cs.length) refresh(cs[0]); }).catch(() => {});
-  </script>
+// ── Step 3: stock
+function stockStep(){
+  shell("Do you hold stock?","If you mainly sell services, or buy only when a customer orders, choose No — you can switch this on later.",`
+    <div class="radio">
+      <label><input type="radio" name="s" value="yes" ${S.inventory?"checked":""}/>Yes — I buy goods and hold them to resell</label>
+      <label><input type="radio" name="s" value="no" ${!S.inventory?"checked":""}/>No — no stock to track</label>
+    </div>`);
+  el("next").onclick = () => { S.inventory = document.querySelector("input[name=s]:checked").value==="yes"; step=4; render(); };
+}
+
+// ── Step 4: banks
+function banksStep(){
+  const rows = S.banks.map((b,i)=>`<tr>
+    <td><input type="text" data-i="${i}" data-k="label" value="${esc(b.label)}" /></td>
+    <td><select data-i="${i}" data-k="kind">
+      ${[["bank","Bank account"],["pos_wallet","POS wallet"],["cash","Cash box"],["domiciliary","Domiciliary"]]
+        .map(([v,t])=>`<option value="${v}" ${b.kind===v?"selected":""}>${t}</option>`).join("")}</select></td>
+    <td><select data-i="${i}" data-k="currency">${["NGN","USD","GBP","EUR"]
+        .map(c=>`<option ${b.currency===c?"selected":""}>${c}</option>`).join("")}</select></td>
+    <td><input type="text" data-i="${i}" data-k="bal" value="${esc(b.bal)}" placeholder="0.00" style="text-align:right"/></td>
+  </tr>`).join("");
+  shell("Bank & cash","Every account you use for the business — and what's in each right now.",`
+    <table><tr><th>Name</th><th>Type</th><th>Currency</th><th>Balance right now (₦)</th></tr>${rows}</table>
+    <button class="ghost" id="add" style="margin-top:10px">+ Add another account</button>
+    <label style="margin-top:16px">As of what date are these balances?</label>
+    <input type="date" id="f-od" value="${S.opening_date}" style="max-width:220px"/>`);
+  document.querySelectorAll("[data-i]").forEach(inp => inp.onchange = e => {
+    S.banks[+e.target.dataset.i][e.target.dataset.k] = e.target.value; });
+  el("add").onclick = () => { S.banks.push({label:"",kind:"bank",currency:"NGN",bal:""}); render(); };
+  el("next").onclick = () => {
+    S.opening_date = el("f-od").value;
+    S.banks = S.banks.filter(b=>b.label.trim());
+    if (!S.banks.length) return err({message:"Add at least one bank or cash account."});
+    step=5; render();
+  };
+}
+
+// ── Step 5: who owes you / who you owe (skippable)
+function owesStep(){
+  const list = (arr, key) => arr.map((c,i)=>`<tr>
+    <td><input type="text" data-l="${key}" data-i="${i}" data-k="name" value="${esc(c.name)}" placeholder="Name"/></td>
+    <td><input type="text" data-l="${key}" data-i="${i}" data-k="phone" value="${esc(c.phone||"")}" placeholder="Phone (optional)"/></td>
+    <td><input type="text" data-l="${key}" data-i="${i}" data-k="amt" value="${esc(c.amt||"")}" placeholder="0.00" style="text-align:right"/></td>
+  </tr>`).join("");
+  shell("Money already out there","Skip this to start fresh — you can only record things from today onwards if you do.",`
+    <label>Who owes you money right now?</label>
+    <table>${list(S.customers,"c")}</table>
+    <button class="ghost" id="addc">+ Add customer</button>
+    <label style="margin-top:18px">Who do you owe money to?</label>
+    <table>${list(S.suppliers,"s")}</table>
+    <button class="ghost" id="adds">+ Add supplier</button>`);
+  document.querySelectorAll("[data-l]").forEach(inp => inp.onchange = e => {
+    const arr = e.target.dataset.l==="c" ? S.customers : S.suppliers;
+    arr[+e.target.dataset.i][e.target.dataset.k] = e.target.value; });
+  el("addc").onclick = () => { S.customers.push({name:"",phone:"",amt:""}); render(); };
+  el("adds").onclick = () => { S.suppliers.push({name:"",phone:"",amt:""}); render(); };
+  el("next").onclick = () => {
+    S.customers = S.customers.filter(c=>c.name.trim()); S.suppliers = S.suppliers.filter(c=>c.name.trim());
+    for (const c of [...S.customers,...S.suppliers]) if (kobo(c.amt)<=0)
+      return err({message:`Please enter the amount for ${c.name}.`});
+    step=6; render();
+  };
+}
+
+// ── Step 6: invoice numbering
+function numberStep(){
+  shell("Invoice numbers","Continuing from a paper book? Start from your next number.",`
+    <label>What number should your first invoice have?</label>
+    <input type="text" id="f-start" value="${esc(S.invoice_start)}" style="max-width:220px"/>
+    <div class="mut" style="margin-top:6px">Example: 2451 → your first invoice is INV-002451. Numbers run in order and are never reused.</div>`);
+  el("next").onclick = () => {
+    const n = parseInt(el("f-start").value,10);
+    if (!n || n<1) return err({message:"Please enter a whole number, 1 or higher."});
+    S.invoice_start = String(n); step=7; render();
+  };
+}
+
+// ── Step 7: people & PIN
+function peopleStep(){
+  shell("Who uses LedgerOne here?","Separate names mean you can always see who recorded what.",`
+    <label>Your name (the owner)</label><input type="text" id="f-owner" value="${esc(S.owner)}"/>
+    <label>Does someone else enter records for you? <span class="mut">(optional)</span></label>
+    <input type="text" id="f-staff" value="${esc(S.staff)}" placeholder="e.g. your accounts officer"/>
+    <label>Choose a 6-digit PIN for the accountant's area</label>
+    <div class="row">
+      <input type="text" id="f-pin" maxlength="6" value="${esc(S.pin)}" placeholder="6 digits" inputmode="numeric"/>
+      <input type="text" id="f-pin2" maxlength="6" value="${esc(S.pin2)}" placeholder="Repeat PIN" inputmode="numeric"/>
+    </div>
+    <div class="mut" style="margin-top:6px">This PIN protects the accountant's area. Your advisor will ask you for it when they review your books.</div>`);
+  el("next").onclick = () => {
+    S.owner = el("f-owner").value.trim(); S.staff = el("f-staff").value.trim();
+    S.pin = el("f-pin").value.trim(); S.pin2 = el("f-pin2").value.trim();
+    if (!S.owner) return err({message:"Please enter your name."});
+    if (!/^\d{6}$/.test(S.pin)) return err({message:"The PIN must be exactly 6 digits."});
+    if (S.pin !== S.pin2) return err({message:"The two PINs don't match."});
+    step=8; render();
+  };
+}
+
+// ── Step 8: review & atomic create (W1)
+function reviewStep(){
+  const d = derive();
+  const bankTotal = S.banks.reduce((t,b)=>t+kobo(b.bal),0);
+  shell("Ready to create your books","Nothing is saved until you press the button — check the summary.",`
+    <table>
+      <tr><td>Business</td><td>${esc(S.name)}</td></tr>
+      <tr><td>VAT on invoices</td><td>${d.vat_registered?"Yes — 7.5%":"No"}</td></tr>
+      <tr><td>Stock tracking</td><td>${S.inventory?"On":"Off"}</td></tr>
+      <tr><td>Accounts</td><td>${S.banks.map(b=>esc(b.label)).join(", ")} (${naira(bankTotal)})</td></tr>
+      <tr><td>Customers owing</td><td>${S.customers.length} — ${naira(S.customers.reduce((t,c)=>t+kobo(c.amt),0))}</td></tr>
+      <tr><td>Suppliers owed</td><td>${S.suppliers.length} — ${naira(S.suppliers.reduce((t,c)=>t+kobo(c.amt),0))}</td></tr>
+      <tr><td>First invoice</td><td>INV-${String(S.invoice_start).padStart(6,"0")}</td></tr>
+      <tr><td>People</td><td>${esc(S.owner)}${S.staff?", "+esc(S.staff):""}</td></tr>
+    </table>`, true, "Create my books");
+  el("next").onclick = async () => {
+    el("next").disabled = true;
+    const d2 = derive();
+    try {
+      const co = await invoke("create_company_full", { input: {
+        company: { name:S.name, vat_registered:d2.vat_registered, vat_exempt:d2.vat_exempt,
+          cit_exempt:d2.cit_exempt, inventory_enabled:S.inventory, fiscal_year_start_month:S.fiscal_month,
+          business_type:S.business_type, tin:S.tin||null, invoice_start:parseInt(S.invoice_start,10),
+          license_key:S.license_key||null },
+        banks: S.banks.map(b=>({label:b.label,kind:b.kind,currency:b.currency,opening_balance_kobo:kobo(b.bal)})),
+        customers_owing: S.customers.map(c=>({name:c.name,phone:c.phone||null,amount_kobo:kobo(c.amt)})),
+        suppliers_owed: S.suppliers.map(c=>({name:c.name,phone:c.phone||null,amount_kobo:kobo(c.amt)})),
+        opening_date: S.opening_date, owner_name:S.owner, staff_name:S.staff||null,
+        advisor_pin: S.pin, eula_version: EULA_VERSION,
+      }});
+      dashboard(co);
+    } catch(e){ el("next").disabled = false; err(e); }
+  };
+}
+
+// ── Dashboard (five tiles, Spec 07 §2.1 — placeholder rendering)
+async function dashboard(co){
+  const dd = await invoke("dashboard",{companyId:co.id});
+  el("main").innerHTML = `<div class="card"><h3>${esc(co.name)}</h3>
+    <div class="mut">Cash today</div><div class="num">${naira(dd.cash_total_kobo)}</div>
+    <table>${dd.cash_accounts.map(a=>`<tr><td>${esc(a.label)}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("")}</table>
+    <table style="margin-top:16px">
+      <tr><td>Who owes me</td><td>${naira(dd.who_owes_me_kobo)}</td></tr>
+      <tr><td>What I owe ${dd.unremitted_tax_kobo>0?`<span class="mut">(incl. ${naira(dd.unremitted_tax_kobo)} tax collected, not yet remitted)</span>`:""}</td>
+          <td>${naira(dd.what_i_owe_kobo)}</td></tr>
+      <tr><td>Profit this month</td><td>${naira(dd.profit_this_month_kobo)}</td></tr>
+    </table></div>`;
+}
+
+// First run: EULA + wizard. Returning: straight to the dashboard.
+invoke("list_companies").then(cs => { if (cs.length) dashboard(cs[0]); else render(); }).catch(() => render());
+</script>
 </body>
 </html>

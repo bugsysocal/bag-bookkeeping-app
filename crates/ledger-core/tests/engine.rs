@@ -736,6 +736,73 @@ fn void_creates_cross_linked_negated_reversal() {
     assert_eq!(trial_balance(&w.conn), 0);
 }
 
+// ===== Full wizard commit (Spec 02 W1 / Spec 10 §5b) =====
+
+#[test]
+fn create_company_full_is_atomic_with_obe_plug() {
+    use ledger_core::seed::{create_company_full, FullSetup, SetupBank, SetupContact};
+    let mut conn = ledger_core::open(":memory:").unwrap();
+    let setup = FullSetup {
+        company: CompanyConfig { name: "Chidinma Ventures".into(), ..Default::default() },
+        banks: vec![
+            SetupBank { label: "GTBank Current".into(), kind: "bank".into(),
+                        currency: "NGN".into(), opening_balance_kobo: 2_400_000_00 },
+            SetupBank { label: "Petty Cash".into(), kind: "cash".into(),
+                        currency: "NGN".into(), opening_balance_kobo: 150_000_00 },
+        ],
+        customers_owing: vec![
+            SetupContact { name: "Chidinma Stores".into(), phone: None, amount_kobo: 1_100_000_00 },
+            SetupContact { name: "Emeka & Sons".into(), phone: None, amount_kobo: 750_000_00 },
+        ],
+        suppliers_owed: vec![
+            SetupContact { name: "Mainland Suppliers".into(), phone: None, amount_kobo: 900_000_00 },
+        ],
+        opening_date: "2026-01-01".into(),
+        owner_name: "Chidinma O.".into(),
+        staff_name: Some("Ngozi (Accounts)".into()),
+        advisor_pin: "482913".into(),
+        eula_version: "EULA-DRAFT-1".into(),
+    };
+    let company = create_company_full(&mut conn, &setup).unwrap();
+
+    // Spec 02 §5.6 worked example: OBE plug = -(2.4M + 0.15M + 1.1M + 0.75M - 0.9M) = -3.5M (Cr).
+    let obe: i64 = conn.query_row(
+        "SELECT SUM(l.amount_kobo) FROM journal_lines l
+         JOIN accounts a ON a.id = l.account_id
+         WHERE a.company_id = ?1 AND a.system_key = 'OPENING_BALANCE_EQUITY'",
+        params![company], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(obe, -3_500_000_00);
+    assert_eq!(trial_balance(&conn), 0, "trial balance zero from the first second");
+
+    // Per-contact AR lines (P8) — aging works from day one.
+    let ar_contacts: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM journal_lines l JOIN accounts a ON a.id = l.account_id
+         WHERE a.system_key = 'AR' AND l.contact_id IS NOT NULL",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(ar_contacts, 2);
+
+    // EULA acceptance recorded append-only; PIN stored as argon2, never plaintext.
+    let (eula_n, pin_hash): (i64, String) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM audit_log WHERE company_id = ?1 AND action = 'eula.accepted'),
+                (SELECT pin_hash FROM users WHERE company_id = ?1 AND role = 'owner')",
+        params![company], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(eula_n, 1);
+    assert!(pin_hash.starts_with("$argon2"));
+    assert!(!pin_hash.contains("482913"));
+
+    // Gate: refusing the agreement means nothing is created (W1 atomicity).
+    let refused = FullSetup { eula_version: "".into(),
+        company: CompanyConfig { name: "No Deal Ltd".into(), ..Default::default() }, ..setup };
+    assert!(create_company_full(&mut conn, &refused).is_err());
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM companies WHERE name = 'No Deal Ltd'", [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(n, 0);
+}
+
 // ===== soft close (P4) =====
 
 #[test]

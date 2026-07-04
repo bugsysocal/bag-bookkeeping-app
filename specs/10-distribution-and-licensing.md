@@ -8,7 +8,7 @@
 
 - **Bundle:** Tauri v2 **NSIS installer** (`.exe`) — per-user install (no admin prompt, matches SME reality of non-admin laptops), desktop + start-menu shortcuts, proper uninstall. MSI deferred until an enterprise client demands GPO deployment.
 - **Targets:** **x64 is the primary client target** (typical Nigerian SME laptops); ARM64 secondary (dev machine + emerging Snapdragon laptops). CI builds both; the dev box cross-compiles x64 via the already-installed `Hostarm64\x64` MSVC tools + `rustup target add x86_64-pc-windows-msvc`.
-- **Authenticode signing:** unsigned builds trip SmartScreen — a client-facing product cannot ship unsigned. v1: **Azure Trusted Signing** (subscription-cheap, HSM-backed, integrates with CI) under Bolton Advisory's identity; fallback: OV cert from a conventional CA. EV only if SmartScreen reputation proves too slow to accumulate. **Decision needed: which legal entity owns the certificate** — it's user-visible in the UAC/properties dialog. *(Decision #1)*
+- **Authenticode signing:** unsigned builds trip SmartScreen — a client-facing product cannot ship unsigned. v1: **Azure Trusted Signing** (subscription-cheap, HSM-backed, integrates with CI); fallback: OV cert from a conventional CA. EV only if SmartScreen reputation proves too slow to accumulate. **Entity CONFIRMED 2026-07-04: Bolton Advisory Group** — CAC registration details to follow; placeholder in build config until provided (no blocker). *(Decision #1 — resolved)*
 
 ## 2. Update Mechanism
 
@@ -38,6 +38,10 @@ Nigeria Data Protection Act 2023 / NDPR: client books contain **personal data** 
 
 None of these change schema or engine behavior; they change wording on two consent screens and one engagement-letter template (the latter being practice-side, outside the app).
 
+## 5b. First-Run EULA / Disclaimer Gate (added per review 2026-07-04)
+
+A **click-through EULA/disclaimer screen precedes the setup wizard** on first run — the wizard does not open until accepted. Content (full text: [docs/legal/EULA.md](../docs/legal/EULA.md), maintained as its own document, not buried here): no warranty of accuracy for calculated figures; the user's responsibility to verify before any regulatory filing; no advisory or professional relationship created by software use alone; limitation of liability. Mechanics: acceptance records an append-only `audit_log` row (`eula.accepted`, version + timestamp — the audit log's immutability is exactly what makes it the right evidence store) and the accepted version is passed into company creation; a future EULA version re-gates on next launch. ⚠️ **The drafted text is NOT lawyer-reviewed — do not distribute outside internal/EdenOceans use until it is** (flagged in PROGRESS.md). *(Decision #6)*
+
 ## 6. Deltas
 
 - Migration **0002**: `ALTER TABLE companies ADD COLUMN license_key TEXT;` — `seed::create_company` accepts and stores it. No validation logic in v1.
@@ -50,6 +54,7 @@ None of these change schema or engine behavior; they change wording on two conse
 3. **v1 license key = stored identifier, offline, unvalidated; format fixed now for v2 signed payloads; advisory-bundled default.** (§3)
 4. **Isolation model as stated** — OS profile is the on-machine boundary; command-layer company scoping; no vendor-side data, ever. (§4)
 5. ⚠️ **NDPA flags (§5)** — confirm the three postures, especially the cross-border sentence on the Spec 09 consent screen and the processor clause living in the engagement letter rather than the app. (§5)
+6. **First-run EULA gate as specified** — click-through before wizard, audit-log acceptance record, re-gate on version change; text pending legal review. (§5b)
 
 ---
 

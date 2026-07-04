@@ -156,6 +156,72 @@ fn create_company(state: tauri::State<Db>, input: NewCompany) -> Result<CompanyD
     Ok(CompanyDto { id, name: input.name })
 }
 
+#[derive(Deserialize)]
+pub struct SetupBankDto {
+    pub label: String,
+    pub kind: String,
+    pub currency: String,
+    pub opening_balance_kobo: i64,
+}
+
+#[derive(Deserialize)]
+pub struct SetupContactDto {
+    pub name: String,
+    pub phone: Option<String>,
+    pub amount_kobo: i64,
+}
+
+#[derive(Deserialize)]
+pub struct FullSetupDto {
+    pub company: NewCompany,
+    pub banks: Vec<SetupBankDto>,
+    pub customers_owing: Vec<SetupContactDto>,
+    pub suppliers_owed: Vec<SetupContactDto>,
+    pub opening_date: String,
+    pub owner_name: String,
+    pub staff_name: Option<String>,
+    pub advisor_pin: String,
+    pub eula_version: String,
+}
+
+/// The whole Spec 02 wizard, atomically (W1): cancel-anywhere leaves zero rows.
+#[tauri::command]
+fn create_company_full(state: tauri::State<Db>, input: FullSetupDto) -> Result<CompanyDto, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    let name = input.company.name.clone();
+    let setup = seed::FullSetup {
+        company: CompanyConfig {
+            name: name.clone(),
+            vat_registered: input.company.vat_registered,
+            vat_exempt: input.company.vat_exempt,
+            cit_exempt: input.company.cit_exempt,
+            inventory_enabled: input.company.inventory_enabled,
+            fiscal_year_start_month: input.company.fiscal_year_start_month,
+            business_type: input.company.business_type,
+            tin: input.company.tin,
+            invoice_start: input.company.invoice_start.unwrap_or(1),
+            license_key: input.company.license_key,
+        },
+        banks: input.banks.into_iter().map(|b| seed::SetupBank {
+            label: b.label, kind: b.kind, currency: b.currency,
+            opening_balance_kobo: b.opening_balance_kobo,
+        }).collect(),
+        customers_owing: input.customers_owing.into_iter().map(|c| seed::SetupContact {
+            name: c.name, phone: c.phone, amount_kobo: c.amount_kobo,
+        }).collect(),
+        suppliers_owed: input.suppliers_owed.into_iter().map(|c| seed::SetupContact {
+            name: c.name, phone: c.phone, amount_kobo: c.amount_kobo,
+        }).collect(),
+        opening_date: input.opening_date,
+        owner_name: input.owner_name,
+        staff_name: input.staff_name,
+        advisor_pin: input.advisor_pin,
+        eula_version: input.eula_version,
+    };
+    let id = seed::create_company_full(&mut conn, &setup).map_err(EngineError::from)?;
+    Ok(CompanyDto { id, name })
+}
+
 #[tauri::command]
 fn list_companies(state: tauri::State<Db>) -> Result<Vec<CompanyDto>, CmdError> {
     let conn = state.0.lock().unwrap();
@@ -293,6 +359,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             create_company,
+            create_company_full,
             list_companies,
             add_bank_account,
             dashboard,
