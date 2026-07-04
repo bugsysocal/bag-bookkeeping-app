@@ -5,7 +5,7 @@
 //! technical detail carried separately for Advisor Mode display.
 
 use ledger_core::engine::{self, PostCtx};
-use ledger_core::rusqlite::{self, Connection};
+use ledger_core::rusqlite::{self, Connection, OptionalExtension};
 use ledger_core::seed::{self, CompanyConfig};
 use ledger_core::EngineError;
 use serde::{Deserialize, Serialize};
@@ -347,6 +347,210 @@ fn record_drawing(
         .map_err(Into::into)
 }
 
+// ===== Sales: contacts, invoices, payments (Spec 03) =====
+
+#[derive(Serialize)]
+struct ContactDto { id: String, name: String, phone: Option<String> }
+
+#[tauri::command]
+fn list_contacts(state: tauri::State<Db>, company_id: String, kind: Option<String>) -> Result<Vec<ContactDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT id, name, phone FROM contacts
+         WHERE company_id = ?1 AND is_active = 1 AND (?2 IS NULL OR kind = ?2 OR kind = 'both')
+         ORDER BY name",
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![company_id, kind], |r| {
+        Ok(ContactDto { id: r.get(0)?, name: r.get(1)?, phone: r.get(2)? })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
+/// Inline create from pickers (Spec 07 §6): a real, deduped record — never a free-text string.
+#[tauri::command]
+fn create_contact(state: tauri::State<Db>, company_id: String, name: String, phone: Option<String>, kind: String) -> Result<ContactDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(CmdError { code: "name_required", message: "Please enter a name.".into(), detail: None });
+    }
+    // Dedupe nudge (Spec 06 §3 rule): exact case/space-insensitive match blocks with guidance.
+    let existing: Option<String> = conn.query_row(
+        "SELECT name FROM contacts WHERE company_id = ?1 AND lower(trim(name)) = lower(?2) AND is_active = 1",
+        rusqlite::params![company_id, name],
+        |r| r.get(0),
+    ).optional().map_err(db_err)?;
+    if let Some(e) = existing {
+        return Err(CmdError {
+            code: "duplicate_contact",
+            message: format!("'{e}' is already in your list — pick them instead of adding twice."),
+            detail: None,
+        });
+    }
+    let id = ledger_core::ids::new_id();
+    conn.execute(
+        "INSERT INTO contacts (id, company_id, kind, name, phone, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![id, company_id, kind, name, phone, ledger_core::ids::now_iso()],
+    ).map_err(db_err)?;
+    Ok(ContactDto { id, name, phone })
+}
+
+#[derive(Deserialize)]
+pub struct InvoiceLineDto {
+    pub description: String,
+    pub quantity_milli: i64,
+    pub unit_price_kobo: i64,
+    pub discount_bp: i64,
+    pub vat_applied: bool,
+}
+
+#[derive(Deserialize)]
+pub struct NewInvoiceDto {
+    pub company_id: String,
+    pub contact_id: String,
+    pub issue_date: String,
+    pub due_date: String,
+    pub lines: Vec<InvoiceLineDto>,
+}
+
+#[derive(Serialize)]
+struct DraftDto { id: String, number: String }
+
+#[tauri::command]
+fn create_invoice_draft(state: tauri::State<Db>, input: NewInvoiceDto) -> Result<DraftDto, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    let lines: Vec<engine::InvoiceLineInput> = input.lines.into_iter().map(|l| engine::InvoiceLineInput {
+        product_id: None,
+        description: l.description,
+        quantity_milli: l.quantity_milli,
+        unit_price_kobo: l.unit_price_kobo,
+        discount_bp: l.discount_bp,
+        vat_applied: l.vat_applied,
+        income_account_id: None, // free-description lines default to 4000 SALES
+    }).collect();
+    let ctx = PostCtx { user_id: None, confirm_soft_close: false };
+    let id = engine::create_invoice(
+        &mut conn, &input.company_id, &input.contact_id, "invoice",
+        &input.issue_date, &input.due_date, &lines, &ctx,
+    )?;
+    let number: String = conn.query_row(
+        "SELECT number FROM invoices WHERE id = ?1", rusqlite::params![id], |r| r.get(0),
+    ).map_err(db_err)?;
+    Ok(DraftDto { id, number })
+}
+
+#[tauri::command]
+fn send_invoice(state: tauri::State<Db>, invoice_id: String, confirm_soft_close: bool) -> Result<(), CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    let ctx = PostCtx { user_id: None, confirm_soft_close };
+    engine::post_invoice(&mut conn, &invoice_id, &ctx)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct InvoiceRowDto {
+    id: String, number: String, customer: String,
+    issue_date: String, due_date: String,
+    total_kobo: i64, paid_kobo: i64, status: String,
+    overdue: bool, // DERIVED, never stored (Spec 03 §2)
+}
+
+#[tauri::command]
+fn list_invoices(state: tauri::State<Db>, company_id: String) -> Result<Vec<InvoiceRowDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let today = ledger_core::ids::now_iso()[..10].to_string();
+    let mut q = conn.prepare(
+        "SELECT i.id, i.number, c.name, i.issue_date, i.due_date, i.total_kobo, i.amount_paid_kobo, i.status
+         FROM invoices i JOIN contacts c ON c.id = i.contact_id
+         WHERE i.company_id = ?1 AND i.kind = 'invoice'
+         ORDER BY i.number DESC LIMIT 200",
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![company_id], |r| {
+        let status: String = r.get(7)?;
+        let due: String = r.get(4)?;
+        Ok(InvoiceRowDto {
+            id: r.get(0)?, number: r.get(1)?, customer: r.get(2)?,
+            issue_date: r.get(3)?, due_date: due.clone(),
+            total_kobo: r.get(5)?, paid_kobo: r.get(6)?,
+            overdue: (status == "sent" || status == "partially_paid") && due < today,
+            status,
+        })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
+#[derive(Serialize)]
+struct OpenInvoiceDto { id: String, number: String, due_date: String, balance_kobo: i64 }
+
+#[tauri::command]
+fn open_invoices(state: tauri::State<Db>, company_id: String, contact_id: String) -> Result<Vec<OpenInvoiceDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT id, number, due_date, total_kobo - amount_paid_kobo
+         FROM invoices
+         WHERE company_id = ?1 AND contact_id = ?2 AND kind = 'invoice'
+           AND status IN ('sent','partially_paid')
+         ORDER BY due_date, number", // FIFO by due date (Spec 03 decision #3)
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![company_id, contact_id], |r| {
+        Ok(OpenInvoiceDto { id: r.get(0)?, number: r.get(1)?, due_date: r.get(2)?, balance_kobo: r.get(3)? })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
+#[derive(Deserialize)]
+pub struct AllocationDto { pub invoice_id: String, pub amount_kobo: i64 }
+
+#[derive(Deserialize)]
+pub struct PaymentInDto {
+    pub company_id: String,
+    pub contact_id: String,
+    pub bank_account_id: String,
+    pub payment_date: String,
+    pub amount_kobo: i64,
+    pub wht_kobo: i64,
+    pub allocations: Vec<AllocationDto>,
+    pub confirm_soft_close: bool,
+}
+
+#[derive(Serialize)]
+struct PaymentDoneDto { receipt_number: Option<String>, deposit_kobo: i64, wht_kobo: i64 }
+
+#[tauri::command]
+fn record_payment_in(state: tauri::State<Db>, input: PaymentInDto) -> Result<PaymentDoneDto, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    let allocs: Vec<engine::Allocation> = input.allocations.into_iter()
+        .map(|a| engine::Allocation { target_id: a.invoice_id, amount_kobo: a.amount_kobo })
+        .collect();
+    let ctx = PostCtx { user_id: None, confirm_soft_close: input.confirm_soft_close };
+    let res = engine::post_payment_in(
+        &mut conn, &input.company_id, &input.contact_id, &input.bank_account_id,
+        &input.payment_date, input.amount_kobo, input.wht_kobo, &allocs, None, &ctx,
+    )?;
+    Ok(PaymentDoneDto {
+        receipt_number: res.receipt_number,
+        deposit_kobo: res.deposit_kobo,
+        wht_kobo: res.wht_kobo,
+    })
+}
+
+#[derive(Serialize)]
+struct BankDto { id: String, label: String, kind: String, currency: String }
+
+#[tauri::command]
+fn list_bank_accounts(state: tauri::State<Db>, company_id: String) -> Result<Vec<BankDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT id, label, kind, currency FROM bank_accounts
+         WHERE company_id = ?1 AND is_active = 1 ORDER BY label",
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![company_id], |r| {
+        Ok(BankDto { id: r.get(0)?, label: r.get(1)?, kind: r.get(2)?, currency: r.get(3)? })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -363,7 +567,15 @@ pub fn run() {
             list_companies,
             add_bank_account,
             dashboard,
-            record_drawing
+            record_drawing,
+            list_contacts,
+            create_contact,
+            create_invoice_draft,
+            send_invoice,
+            list_invoices,
+            open_invoices,
+            record_payment_in,
+            list_bank_accounts
         ])
         .run(tauri::generate_context!())
         .expect("error while running LedgerOne");

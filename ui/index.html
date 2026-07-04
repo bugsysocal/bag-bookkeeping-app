@@ -15,6 +15,16 @@
   label { display:block; margin:12px 0 4px; font-weight:600; font-size:14px; }
   input[type=text], input[type=date], select { width:100%; box-sizing:border-box; padding:9px 10px; border:1px solid var(--line); border-radius:8px; font-size:15px; }
   .row { display:flex; gap:10px; } .row > * { flex:1; }
+  /* Bottom-align paired inputs even when one label wraps (fixes Step-1 TIN/license baseline) */
+  .row > div { display:flex; flex-direction:column; justify-content:flex-end; }
+  .toolbar { display:flex; gap:10px; margin:0 0 16px; align-items:center; }
+  .toolbar .spacer { flex:1; }
+  .chip { padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600; }
+  .chip.paid { background:#f0fdf4; color:#166534; } .chip.sent { background:#eff6ff; color:#1e40af; }
+  .chip.partially_paid { background:#fefce8; color:#854d0e; } .chip.overdue { background:#fef2f2; color:#991b1b; }
+  .chip.draft { background:#f1f5f9; color:#475569; } .chip.void { background:#f1f5f9; color:#94a3b8; text-decoration:line-through; }
+  a.navlink { color:var(--green); cursor:pointer; text-decoration:none; font-weight:600; margin-right:14px; }
+  tr.rowlink:hover td { background:#f8faf8; cursor:pointer; }
   button { background:var(--green); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:15px; cursor:pointer; }
   button.ghost { background:#fff; color:var(--green); border:1px solid var(--green); }
   button:disabled { opacity:.45; cursor:default; }
@@ -306,27 +316,230 @@ function reviewStep(){
         opening_date: S.opening_date, owner_name:S.owner, staff_name:S.staff||null,
         advisor_pin: S.pin, eula_version: EULA_VERSION,
       }});
-      dashboard(co);
+      CO = co; viewDashboard();
     } catch(e){ el("next").disabled = false; err(e); }
   };
 }
 
-// ── Dashboard (five tiles, Spec 07 §2.1 — placeholder rendering)
-async function dashboard(co){
-  const dd = await invoke("dashboard",{companyId:co.id});
-  el("main").innerHTML = `<div class="card"><h3>${esc(co.name)}</h3>
+// ════════ App views (post-setup) ════════
+let CO = null;                      // active company {id, name}
+const today = () => new Date().toISOString().slice(0,10);
+const dmy = iso => iso ? `${iso.slice(8,10)}/${iso.slice(5,7)}/${iso.slice(0,4)}` : "";
+const VAT_BP = 750;                 // display estimate only — the engine's numbers are the truth
+
+// Three primary actions, always visible (Spec 07 §2.2); Record Expense lands with Spec 04 UI.
+function chrome(active, body){
+  el("main").innerHTML = `
+    <div class="toolbar">
+      <a class="navlink" id="n-home">Home</a>
+      <a class="navlink" id="n-inv">Invoices</a>
+      <span class="spacer"></span>
+      <button id="a-newinv">New Invoice</button>
+      <button class="ghost" id="a-pay">Record Payment</button>
+    </div>${body}<div id="err"></div>`;
+  el("n-home").onclick = viewDashboard; el("n-inv").onclick = viewInvoices;
+  el("a-newinv").onclick = viewNewInvoice; el("a-pay").onclick = () => viewRecordPayment();
+}
+
+async function viewDashboard(){
+  const dd = await invoke("dashboard",{companyId:CO.id});
+  chrome("home", `<div class="card"><h3>${esc(CO.name)}</h3>
     <div class="mut">Cash today</div><div class="num">${naira(dd.cash_total_kobo)}</div>
     <table>${dd.cash_accounts.map(a=>`<tr><td>${esc(a.label)}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("")}</table>
     <table style="margin-top:16px">
-      <tr><td>Who owes me</td><td>${naira(dd.who_owes_me_kobo)}</td></tr>
+      <tr class="rowlink" id="t-owes"><td>Who owes me</td><td>${naira(dd.who_owes_me_kobo)}</td></tr>
       <tr><td>What I owe ${dd.unremitted_tax_kobo>0?`<span class="mut">(incl. ${naira(dd.unremitted_tax_kobo)} tax collected, not yet remitted)</span>`:""}</td>
           <td>${naira(dd.what_i_owe_kobo)}</td></tr>
       <tr><td>Profit this month</td><td>${naira(dd.profit_this_month_kobo)}</td></tr>
-    </table></div>`;
+    </table></div>`);
+  el("t-owes").onclick = viewInvoices;
+}
+
+// ── Invoice register (Spec 03 §2; Overdue derived, shown as chip, never stored)
+async function viewInvoices(){
+  const rows = await invoke("list_invoices",{companyId:CO.id});
+  const body = rows.length ? `<div class="card"><h3>Invoices</h3><table>
+      <tr><th>Number</th><th>Customer</th><th>Date</th><th>Due</th><th>Status</th><th>Total</th><th>Still owed</th></tr>
+      ${rows.map(r=>{
+        const chip = r.overdue ? "overdue" : r.status;
+        const label = r.overdue ? "Overdue" : ({draft:"Draft",sent:"Sent",partially_paid:"Part-paid",paid:"Paid",void:"Cancelled"}[r.status]||r.status);
+        return `<tr><td>${esc(r.number)}</td><td>${esc(r.customer)}</td><td>${dmy(r.issue_date)}</td><td>${dmy(r.due_date)}</td>
+          <td><span class="chip ${chip}">${label}</span></td><td>${naira(r.total_kobo)}</td><td>${naira(r.total_kobo-r.paid_kobo)}</td></tr>`;
+      }).join("")}</table></div>`
+    : `<div class="card"><h3>Invoices</h3><div class="mut">No invoices yet — create your first with the button above.</div></div>`;
+  chrome("inv", body);
+}
+
+// ── Customer picker with inline create (Spec 07 §6: real deduped record, never free text)
+async function customerPicker(sel){
+  const cs = await invoke("list_contacts",{companyId:CO.id, kind:"customer"});
+  return `<label>Customer</label>
+    <div class="row"><select id="${sel}">
+      <option value="">— choose —</option>
+      ${cs.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join("")}
+    </select><div style="max-width:170px"><button class="ghost" id="${sel}-new" style="width:100%">+ New customer</button></div></div>
+    <div id="${sel}-form" style="display:none">
+      <div class="row"><div><label>Name</label><input type="text" id="${sel}-nm"/></div>
+      <div><label>Phone</label><input type="text" id="${sel}-ph"/></div></div>
+      <button class="ghost" id="${sel}-save" style="margin-top:8px">Save customer</button>
+    </div>`;
+}
+function wirePicker(sel, onCreated){
+  el(`${sel}-new`).onclick = () => el(`${sel}-form`).style.display = "";
+  el(`${sel}-save`).onclick = async () => {
+    try {
+      const c = await invoke("create_contact",{companyId:CO.id, name:el(`${sel}-nm`).value,
+        phone:el(`${sel}-ph`).value||null, kind:"customer"});
+      onCreated(c);
+    } catch(e){ err(e); }
+  };
+}
+
+// ── New invoice (Spec 03 §4) — free-description lines; VAT per line; totals are estimates,
+//    frozen server-side at posting (engine rounding is normative).
+function viewNewInvoice(){
+  customerPicker("cust").then(pickerHtml => {
+    const L = [{d:"",q:"1",p:"",disc:"0",vat:true}];
+    const linesHtml = () => L.map((l,i)=>`<tr>
+      <td style="width:34%"><input type="text" data-i="${i}" data-k="d" value="${esc(l.d)}" placeholder="What did you sell?"/></td>
+      <td><input type="text" data-i="${i}" data-k="q" value="${esc(l.q)}" style="text-align:right"/></td>
+      <td><input type="text" data-i="${i}" data-k="p" value="${esc(l.p)}" placeholder="0.00" style="text-align:right"/></td>
+      <td><input type="text" data-i="${i}" data-k="disc" value="${esc(l.disc)}" style="text-align:right"/></td>
+      <td style="text-align:center"><input type="checkbox" data-i="${i}" data-k="vat" ${l.vat?"checked":""}/></td>
+    </tr>`).join("");
+    const totals = () => {
+      let net = 0, vat = 0;
+      for (const l of L){
+        const qm = Math.round(parseFloat(l.q||"0")*1000), pk = kobo(l.p), db = Math.round(parseFloat(l.disc||"0")*100);
+        if (qm>0 && pk>=0){ const n = Math.round(qm*pk/1000*(10000-db)/10000); net += n; if (l.vat) vat += Math.round(n*VAT_BP/10000); }
+      }
+      return {net, vat, total: net+vat};
+    };
+    const paint = () => {
+      el("lines").innerHTML = linesHtml();
+      document.querySelectorAll("#lines [data-i]").forEach(inp => {
+        inp.onchange = e => { L[+e.target.dataset.i][e.target.dataset.k] =
+          e.target.type==="checkbox" ? e.target.checked : e.target.value; sums(); };
+      });
+      sums();
+    };
+    const sums = () => { const t = totals();
+      el("sums").innerHTML = `Subtotal ${naira(t.net)} · VAT ${naira(t.vat)} · <b>Total ${naira(t.total)}</b> <span class="mut">(final figures set when you send)</span>`; };
+    chrome("newinv", `<div class="card"><h3>New invoice</h3>${pickerHtml}
+      <div class="row"><div><label>Invoice date</label><input type="date" id="f-issue" value="${today()}"/></div>
+      <div><label>Payment due by</label><input type="date" id="f-due" value="${today()}"/></div></div>
+      <table><tr><th>Item</th><th>Qty</th><th>Price (₦)</th><th>Discount %</th><th>VAT</th></tr>
+        <tbody id="lines"></tbody></table>
+      <button class="ghost" id="addline" style="margin-top:8px">+ Add line</button>
+      <div class="ok" id="sums" style="margin-top:14px"></div>
+      <div class="nav"><button class="ghost" id="saveDraft">Save for later</button>
+        <button id="saveSend">Save &amp; send</button></div></div>`);
+    paint();
+    wirePicker("cust", c => { viewNewInvoice(); });
+    el("addline").onclick = () => { L.push({d:"",q:"1",p:"",disc:"0",vat:true}); paint(); };
+    const collect = () => {
+      const contact = el("cust").value;
+      if (!contact) throw {message:"Please choose a customer first."};
+      const lines = L.filter(l=>l.d.trim()).map(l=>({
+        description:l.d.trim(), quantity_milli:Math.round(parseFloat(l.q||"0")*1000),
+        unit_price_kobo:kobo(l.p), discount_bp:Math.round(parseFloat(l.disc||"0")*100), vat_applied:!!l.vat }));
+      if (!lines.length) throw {message:"Add at least one line — what are you selling?"};
+      return { company_id:CO.id, contact_id:contact, issue_date:el("f-issue").value, due_date:el("f-due").value, lines };
+    };
+    el("saveDraft").onclick = async () => {
+      try { const d = await invoke("create_invoice_draft",{input:collect()}); toast(`Saved as a draft — ${d.number}.`); viewInvoices(); }
+      catch(e){ err(e); }
+    };
+    el("saveSend").onclick = async () => {
+      try { const d = await invoke("create_invoice_draft",{input:collect()});
+        await invoke("send_invoice",{invoiceId:d.id, confirmSoftClose:false});
+        toast(`${d.number} sent — it's now in your books.`); viewInvoices(); }
+      catch(e){ err(e); }
+    };
+  });
+}
+
+// ── Record payment (Spec 03 §5): FIFO auto-allocation, WHT collapsed, deposit remainder live
+function viewRecordPayment(){
+  customerPicker("pc").then(async pickerHtml => {
+    const banks = await invoke("list_bank_accounts",{companyId:CO.id});
+    chrome("pay", `<div class="card"><h3>Record a payment you received</h3>${pickerHtml}
+      <div class="row">
+        <div><label>Paid into</label><select id="f-bank">${banks.map(b=>`<option value="${b.id}">${esc(b.label)}</option>`).join("")}</select></div>
+        <div><label>Date</label><input type="date" id="f-date" value="${today()}"/></div>
+        <div><label>Amount received (₦)</label><input type="text" id="f-amt" placeholder="0.00" style="text-align:right"/></div>
+      </div>
+      <details style="margin-top:10px"><summary class="mut">Did the customer deduct tax (WHT)?</summary>
+        <label>Amount they held back (₦)</label>
+        <input type="text" id="f-wht" placeholder="0.00" style="max-width:200px;text-align:right"/>
+        <div class="mut">Enter exactly what they withheld — LedgerOne records it as tax you can claim.</div>
+      </details>
+      <div id="allocwrap"></div>
+      <div class="ok" id="remain" style="display:none"></div>
+      <div class="nav"><span></span><button id="savePay">Save payment</button></div></div>`);
+    let open = [];
+    const allocs = () => [...document.querySelectorAll("[data-alloc]")].map(inp => ({
+      invoice_id: inp.dataset.alloc, amount_kobo: kobo(inp.value) }));
+    const refreshRemain = () => {
+      const cash = kobo(el("f-amt").value), wht = kobo(el("f-wht") ? el("f-wht").value : "0");
+      const used = allocs().reduce((t,a)=>t+a.amount_kobo,0);
+      const left = cash + wht - used;
+      const r = el("remain"); r.style.display = "";
+      r.innerHTML = left > 0 ? `₦${(left/100).toLocaleString("en-NG")} will be kept as a deposit for this customer.`
+        : left === 0 ? "Everything is matched to invoices." : `<span style="color:#991b1b">You've matched more than was received.</span>`;
+    };
+    const autoFill = () => { // FIFO by due date (server ordering), editable after
+      let pool = kobo(el("f-amt").value) + kobo(el("f-wht") ? el("f-wht").value : "0");
+      document.querySelectorAll("[data-alloc]").forEach(inp => {
+        const bal = +inp.dataset.bal; const take = Math.max(0, Math.min(bal, pool)); pool -= take;
+        inp.value = take ? (take/100).toFixed(2) : ""; });
+      refreshRemain();
+    };
+    const loadOpen = async () => {
+      const cid = el("pc").value; if (!cid) { el("allocwrap").innerHTML = ""; return; }
+      open = await invoke("open_invoices",{companyId:CO.id, contactId:cid});
+      el("allocwrap").innerHTML = open.length ? `<table>
+          <tr><th>Invoice</th><th>Due</th><th>Still owed</th><th>Pay off (₦)</th></tr>
+          ${open.map(o=>`<tr><td>${esc(o.number)}</td><td>${dmy(o.due_date)}</td><td>${naira(o.balance_kobo)}</td>
+            <td><input type="text" data-alloc="${o.id}" data-bal="${o.balance_kobo}" style="text-align:right"/></td></tr>`).join("")}
+        </table>`
+        : `<div class="mut" style="margin-top:10px">No unpaid invoices — this whole amount will be kept as the customer's deposit ("paid ahead").</div>`;
+      document.querySelectorAll("[data-alloc]").forEach(inp => inp.onchange = refreshRemain);
+      autoFill();
+    };
+    el("pc").onchange = loadOpen;
+    el("f-amt").onchange = autoFill;
+    el("f-wht").onchange = autoFill;
+    wirePicker("pc", c => viewRecordPayment());
+    el("savePay").onclick = async () => {
+      try {
+        const cid = el("pc").value; if (!cid) return err({message:"Please choose a customer first."});
+        const res = await invoke("record_payment_in",{input:{
+          company_id:CO.id, contact_id:cid, bank_account_id:el("f-bank").value,
+          payment_date:el("f-date").value, amount_kobo:kobo(el("f-amt").value),
+          wht_kobo:kobo(el("f-wht").value), allocations:allocs().filter(a=>a.amount_kobo>0),
+          confirm_soft_close:false }});
+        toast(`Payment saved${res.receipt_number ? " — receipt " + res.receipt_number : ""}${res.deposit_kobo>0 ? `; ${naira(res.deposit_kobo)} kept as deposit` : ""}.`);
+        viewInvoices();
+      } catch(e){ err(e); }
+    };
+  });
+}
+
+let toastTimer;
+function toast(msg){
+  let t = el("toast");
+  if (!t){ t = document.createElement("div"); t.id = "toast";
+    t.style.cssText = "position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#14532d;color:#fff;padding:10px 22px;border-radius:99px;font-size:14px;box-shadow:0 4px 14px rgba(0,0,0,.25);z-index:9";
+    document.body.appendChild(t); }
+  t.textContent = msg; t.style.display = "";
+  clearTimeout(toastTimer); toastTimer = setTimeout(()=>{ t.style.display="none"; }, 5000);
 }
 
 // First run: EULA + wizard. Returning: straight to the dashboard.
-invoke("list_companies").then(cs => { if (cs.length) dashboard(cs[0]); else render(); }).catch(() => render());
+invoke("list_companies").then(cs => {
+  if (cs.length){ CO = cs[0]; viewDashboard(); } else render();
+}).catch(() => render());
 </script>
 </body>
 </html>
