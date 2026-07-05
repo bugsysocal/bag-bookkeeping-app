@@ -894,6 +894,171 @@ fn log_delivery(state: tauri::State<Db>, company_id: String, doc_type: String, d
     Ok(())
 }
 
+// ===== Reconciliation (Spec 04 §6–7) =====
+
+use ledger_core::recon;
+
+#[derive(Serialize)]
+struct ReconDto { id: String, statement_date: String, statement_balance_kobo: i64 }
+
+#[tauri::command]
+fn recon_open(state: tauri::State<Db>, bank_account_id: String) -> Result<Option<ReconDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    conn.query_row(
+        "SELECT id, statement_date, statement_balance_kobo FROM reconciliations
+         WHERE bank_account_id = ?1 AND status = 'in_progress'",
+        rusqlite::params![bank_account_id],
+        |r| Ok(ReconDto { id: r.get(0)?, statement_date: r.get(1)?, statement_balance_kobo: r.get(2)? }),
+    ).optional().map_err(db_err)
+}
+
+#[tauri::command]
+fn recon_start(state: tauri::State<Db>, company_id: String, bank_account_id: String,
+               statement_date: String, statement_balance_kobo: i64) -> Result<String, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    recon::start_reconciliation(&mut conn, &company_id, &bank_account_id, &statement_date, statement_balance_kobo)
+        .map_err(Into::into)
+}
+
+#[derive(Deserialize)]
+pub struct MappingDto {
+    pub header_rows: usize,
+    pub date_col: usize,
+    pub desc_col: usize,
+    pub amount_col: Option<usize>,
+    pub debit_col: Option<usize>,
+    pub credit_col: Option<usize>,
+    pub date_format: String,
+    pub flip_sign: bool,
+}
+
+#[derive(Serialize)]
+struct ImportResultDto { imported: usize, skipped: usize, errors: Vec<String> }
+
+#[tauri::command]
+fn recon_import_csv(state: tauri::State<Db>, recon_id: String, csv_text: String, mapping: MappingDto)
+    -> Result<ImportResultDto, CmdError>
+{
+    let mut conn = state.0.lock().unwrap();
+    let map = recon::CsvMapping {
+        header_rows: mapping.header_rows, date_col: mapping.date_col, desc_col: mapping.desc_col,
+        amount_col: mapping.amount_col, debit_col: mapping.debit_col, credit_col: mapping.credit_col,
+        date_format: mapping.date_format, flip_sign: mapping.flip_sign,
+    };
+    let (rows, errors) = recon::parse_csv(&csv_text, &map);
+    if rows.is_empty() {
+        return Err(CmdError {
+            code: "empty_import",
+            message: "No usable lines found — check the column choices match your bank's file.".into(),
+            detail: Some(errors.join("; ")),
+        });
+    }
+    let (imported, skipped) = recon::import_rows(&mut conn, &recon_id, &rows)?;
+    Ok(ImportResultDto { imported, skipped, errors })
+}
+
+#[derive(Serialize)]
+struct ReconLineDto {
+    id: String, stmt_date: String, description: Option<String>, amount_kobo: i64,
+    state: String, match_kind: Option<String>, review_note: Option<String>, carried: bool,
+}
+
+#[derive(Serialize)]
+struct ReconStateDto {
+    lines: Vec<ReconLineDto>,
+    statement_balance_kobo: i64, matched_kobo: i64, unresolved_kobo: i64,
+    ledger_at_date_kobo: i64, outstanding_kobo: i64,
+}
+
+#[tauri::command]
+fn recon_state(state: tauri::State<Db>, recon_id: String) -> Result<ReconStateDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT id, stmt_date, stmt_description, stmt_amount_kobo, state, match_kind,
+                review_note, carried_from_id IS NOT NULL
+         FROM reconciliation_lines WHERE reconciliation_id = ?1
+         ORDER BY state = 'needs_review' DESC, stmt_date, id",
+    ).map_err(db_err)?;
+    let lines = q.query_map(rusqlite::params![recon_id], |r| {
+        Ok(ReconLineDto {
+            id: r.get(0)?, stmt_date: r.get(1)?, description: r.get(2)?, amount_kobo: r.get(3)?,
+            state: r.get(4)?, match_kind: r.get(5)?, review_note: r.get(6)?,
+            carried: r.get::<_, i64>(7)? != 0,
+        })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    let eq = recon::equation(&conn, &recon_id)?;
+    Ok(ReconStateDto {
+        lines,
+        statement_balance_kobo: eq.statement_balance_kobo, matched_kobo: eq.matched_kobo,
+        unresolved_kobo: eq.unresolved_kobo, ledger_at_date_kobo: eq.ledger_at_date_kobo,
+        outstanding_kobo: eq.outstanding_kobo,
+    })
+}
+
+#[derive(Serialize)]
+struct CandidateDto { journal_line_id: String, entry_date: String, memo: String, amount_kobo: i64 }
+
+/// Unmatched ledger lines on the account near the statement line's date.
+#[tauri::command]
+fn recon_candidates(state: tauri::State<Db>, recon_id: String, line_id: String) -> Result<Vec<CandidateDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT l.id, e.entry_date, e.memo, l.amount_kobo
+         FROM journal_lines l
+         JOIN journal_entries e ON e.id = l.entry_id
+         JOIN reconciliations r ON r.id = ?1
+         JOIN bank_accounts b ON b.id = r.bank_account_id
+         JOIN reconciliation_lines rl ON rl.id = ?2
+         WHERE l.account_id = b.account_id AND e.is_posted = 1
+           AND NOT EXISTS (SELECT 1 FROM reconciliation_matches m WHERE m.journal_line_id = l.id)
+           AND ABS(julianday(e.entry_date) - julianday(rl.stmt_date)) <= 14
+         ORDER BY ABS(l.amount_kobo - rl.stmt_amount_kobo), e.entry_date
+         LIMIT 20",
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![recon_id, line_id], |r| {
+        Ok(CandidateDto { journal_line_id: r.get(0)?, entry_date: r.get(1)?, memo: r.get(2)?, amount_kobo: r.get(3)? })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
+#[tauri::command]
+fn recon_match(state: tauri::State<Db>, line_id: String, journal_line_ids: Vec<String>) -> Result<(), CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    recon::manual_match(&mut conn, &line_id, &journal_line_ids, "manual").map_err(Into::into)
+}
+
+#[tauri::command]
+fn recon_unmatch(state: tauri::State<Db>, line_id: String) -> Result<(), CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    recon::unmatch(&mut conn, &line_id).map_err(Into::into)
+}
+
+#[tauri::command]
+fn recon_flag(state: tauri::State<Db>, line_id: String, note: String) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    recon::flag_needs_review(&conn, &line_id, &note, None).map_err(Into::into)
+}
+
+#[tauri::command]
+fn recon_writeoff(state: tauri::State<Db>, line_id: String, note: String) -> Result<(), CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    let ctx = PostCtx::default();
+    recon::write_off(&mut conn, &line_id, &note, &ctx)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn recon_import_error(state: tauri::State<Db>, line_id: String) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    recon::mark_import_error(&conn, &line_id, &PostCtx::default()).map_err(Into::into)
+}
+
+#[tauri::command]
+fn recon_complete(state: tauri::State<Db>, recon_id: String) -> Result<String, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    recon::complete(&mut conn, &recon_id).map_err(Into::into)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -933,7 +1098,18 @@ pub fn run() {
             void_payment_cmd,
             convert_quote_cmd,
             invoice_doc,
-            log_delivery
+            log_delivery,
+            recon_open,
+            recon_start,
+            recon_import_csv,
+            recon_state,
+            recon_candidates,
+            recon_match,
+            recon_unmatch,
+            recon_flag,
+            recon_writeoff,
+            recon_import_error,
+            recon_complete
         ])
         .run(tauri::generate_context!())
         .expect("error while running LedgerOne");

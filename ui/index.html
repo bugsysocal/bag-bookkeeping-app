@@ -833,6 +833,9 @@ async function viewBank(){
   chrome("bank", `<div class="card"><h3>Bank &amp; Cash</h3>
     <table>${dd.cash_accounts.map(a=>`<tr><td>${esc(a.label)}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("")}
       <tr><td><b>Total</b></td><td><b>${naira(dd.cash_total_kobo)}</b></td></tr></table>
+    <h3 style="margin-top:22px">Check against the bank ("reconcile")</h3>
+    <div class="mut">Compare your records with the bank's statement — the habit that keeps books honest.</div>
+    <div class="toolbar" style="margin-top:8px">${banks.map(b=>`<button class="ghost" data-rec="${b.id}" data-lbl="${esc(b.label)}">${esc(b.label)}</button>`).join("")}</div>
     <h3 style="margin-top:22px">Move money between accounts</h3>
     <div class="mut">Moving your own money is never income or a cost — LedgerOne records it correctly.</div>
     <div class="row">
@@ -869,6 +872,143 @@ async function viewBank(){
   };
   el("d-out").onclick = drawing(true);
   el("d-in").onclick = drawing(false);
+  document.querySelectorAll("[data-rec]").forEach(b => b.onclick = () => viewRecon(b.dataset.rec, b.dataset.lbl));
+}
+
+// ════════ Reconciliation (Spec 04 §6–7) ════════
+// The needs-review state is the no-Suspense mechanism: flagging posts NOTHING;
+// the unclear line is quarantined visibly and carries forward until resolved.
+
+const RCHIP = { unmatched:["sent","To sort out"], matched:["paid","Matched"], entry_created:["paid","Recorded"],
+  needs_review:["overdue","Needs review"], written_off:["draft","Written off"], import_error:["void","Import error"] };
+
+async function viewRecon(bankId, label){
+  const open = await invoke("recon_open",{bankAccountId:bankId});
+  if (!open){
+    chrome("recon", `<div class="card"><h3>Check ${esc(label)} against the bank</h3>
+      <div class="mut">Take these two numbers from the bank statement you're checking.</div>
+      <div class="row">
+        <div><label>Statement end date</label><input type="date" id="r-date" value="${today()}"/></div>
+        <div><label>Closing balance on the statement (₦)</label><input type="text" id="r-bal" placeholder="0.00" style="text-align:right"/></div>
+      </div>
+      <div class="nav"><button class="ghost" id="r-back">Back</button><button id="r-start">Start checking</button></div></div>`);
+    el("r-back").onclick = viewBank;
+    el("r-start").onclick = async () => {
+      try {
+        await invoke("recon_start",{companyId:CO.id, bankAccountId:bankId,
+          statementDate:el("r-date").value, statementBalanceKobo:kobo(el("r-bal").value)});
+        viewRecon(bankId, label);
+      } catch(e){ err(e); }
+    };
+    return;
+  }
+  const st = await invoke("recon_state",{reconId:open.id});
+  const row = l => {
+    const [cls, lbl] = RCHIP[l.state] || ["draft", l.state];
+    const acts = [];
+    if (l.state==="unmatched" || l.state==="needs_review"){
+      acts.push(`<a class="navlink" data-ra="match" data-id="${l.id}">Match</a>`);
+      acts.push(`<a class="navlink" data-ra="writeoff" data-id="${l.id}">Write off</a>`);
+      if (l.state==="unmatched") acts.push(`<a class="navlink" data-ra="flag" data-id="${l.id}">Not sure</a>`);
+      acts.push(`<a class="navlink" data-ra="mistake" data-id="${l.id}">Bad row</a>`);
+    }
+    if (l.state==="matched" || l.state==="entry_created")
+      acts.push(`<a class="navlink" data-ra="unmatch" data-id="${l.id}">Undo</a>`);
+    return `<tr><td>${dmy(l.stmt_date)}</td><td>${esc(l.description||"")}
+        ${l.carried?'<span class="mut">· brought forward</span>':""}
+        ${l.review_note?`<div class="mut" style="font-size:12px">${esc(l.review_note)}</div>`:""}</td>
+      <td>${naira(l.amount_kobo)}</td><td><span class="chip ${cls}">${lbl}</span>${l.match_kind==="auto"?' <span class="mut">auto</span>':""}</td>
+      <td><span id="act-${l.id}">${acts.join(" ")}</span></td></tr>`;
+  };
+  chrome("recon", `<div class="card"><h3>Checking ${esc(label)}</h3>
+    <div class="ok">Statement balance ${naira(st.statement_balance_kobo)} · Matched so far ${naira(st.matched_kobo)}
+      · Still to sort out ${naira(st.unresolved_kobo)} · In your books at that date ${naira(st.ledger_at_date_kobo)}
+      · In the books but not on this statement ${naira(st.outstanding_kobo)}</div>
+    <details ${st.lines.length?"":"open"} style="margin:12px 0"><summary class="mut">Import the bank statement (CSV file)</summary>
+      <div class="row" style="margin-top:8px">
+        <div><label>File</label><input type="file" id="csvfile" accept=".csv,.txt"/></div>
+        <div><label>Rows to skip (headers)</label><input type="text" id="m-skip" value="1"/></div>
+        <div><label>Date format</label><select id="m-fmt"><option>DMY</option><option>YMD</option><option>MDY</option></select></div>
+      </div>
+      <div class="row">
+        <div><label>Date column #</label><input type="text" id="m-date" value="1"/></div>
+        <div><label>Description column #</label><input type="text" id="m-desc" value="2"/></div>
+        <div><label>Amount style</label><select id="m-mode"><option value="dc">Debit + credit columns</option><option value="signed">One signed column</option></select></div>
+        <div id="m-dcwrap"><label>Debit / credit col #</label><div class="row">
+          <input type="text" id="m-dr" value="3"/><input type="text" id="m-cr" value="4"/></div></div>
+      </div>
+      <button class="ghost" id="doimport" style="margin-top:8px">Import</button>
+      <div class="mut" style="margin-top:4px">Column numbers count from 1, left to right. Lines already imported before are skipped automatically.</div>
+    </details>
+    ${st.lines.length?`<table><tr><th>Date</th><th>Bank says</th><th>Amount</th><th>Status</th><th></th></tr>
+      ${st.lines.map(row).join("")}</table>`:""}
+    <div class="nav"><button class="ghost" id="r-back">Back</button>
+      <button id="r-done">Finish checking</button></div></div>`);
+  el("r-back").onclick = viewBank;
+
+  el("doimport").onclick = async () => {
+    const f = el("csvfile").files[0];
+    if (!f) return err({message:"Choose the CSV file your bank gave you."});
+    const text = await f.text();
+    const dc = el("m-mode").value === "dc";
+    const col = id => Math.max(0, (parseInt(el(id).value,10)||1) - 1);
+    try {
+      const res = await invoke("recon_import_csv",{reconId:open.id, csvText:text, mapping:{
+        header_rows: parseInt(el("m-skip").value,10)||0,
+        date_col: col("m-date"), desc_col: col("m-desc"),
+        amount_col: dc ? null : col("m-dr"),
+        debit_col: dc ? col("m-dr") : null, credit_col: dc ? col("m-cr") : null,
+        date_format: el("m-fmt").value, flip_sign: false }});
+      toast(`${res.imported} line(s) imported, ${res.skipped} already present${res.errors.length?`, ${res.errors.length} row(s) couldn't be read`:""}.`);
+      viewRecon(bankId, label);
+    } catch(e){ err(e); }
+  };
+
+  const inlineNote = (id, placeholder, onGo) => {
+    el(`act-${id}`).innerHTML = `<input type="text" id="note-${id}" placeholder="${placeholder}" style="max-width:220px"/>
+      <button class="ghost" id="go-${id}" style="padding:4px 10px">OK</button>`;
+    el(`go-${id}`).onclick = () => onGo(el(`note-${id}`).value);
+  };
+
+  document.querySelectorAll("[data-ra]").forEach(a => a.onclick = async () => {
+    const id = a.dataset.id;
+    try {
+      if (a.dataset.ra === "unmatch"){ await invoke("recon_unmatch",{lineId:id}); return viewRecon(bankId, label); }
+      if (a.dataset.ra === "mistake"){
+        if (!window.confirm("Mark this row as an import mistake? It'll be set aside — nothing goes into your books.")) return;
+        await invoke("recon_import_error",{lineId:id}); return viewRecon(bankId, label);
+      }
+      if (a.dataset.ra === "flag")
+        return inlineNote(id, "What do you know about this line?", async note => {
+          try { await invoke("recon_flag",{lineId:id, note}); viewRecon(bankId, label); } catch(e){ err(e); }
+        });
+      if (a.dataset.ra === "writeoff")
+        return inlineNote(id, "Why write it off? (e.g. bank charge)", async note => {
+          try { await invoke("recon_writeoff",{lineId:id, note}); toast("Written off — recorded in your books."); viewRecon(bankId, label); } catch(e){ err(e); }
+        });
+      if (a.dataset.ra === "match"){
+        const cands = await invoke("recon_candidates",{reconId:open.id, lineId:id});
+        if (!cands.length) return err({message:"Nothing nearby in your books to match — record it first (Record Expense / Record Payment), then match."});
+        el(`act-${id}`).innerHTML = cands.map(c=>`<label style="display:block;font-weight:400;font-size:13px">
+            <input type="checkbox" data-cand="${c.journal_line_id}"/> ${dmy(c.entry_date)} · ${esc(c.memo)} · ${naira(c.amount_kobo)}</label>`).join("")
+          + `<button class="ghost" id="go-${id}" style="padding:4px 10px;margin-top:4px">Match selected</button>`;
+        el(`go-${id}`).onclick = async () => {
+          const ids = [...el(`act-${id}`).querySelectorAll("[data-cand]:checked")].map(c=>c.dataset.cand);
+          try { await invoke("recon_match",{lineId:id, journalLineIds:ids}); viewRecon(bankId, label); } catch(e){ err(e); }
+        };
+      }
+    } catch(e){ err(e); }
+  });
+
+  el("r-done").onclick = async () => {
+    try {
+      const status = await invoke("recon_complete",{reconId:open.id});
+      toast(status === "completed_with_exceptions"
+        ? "Done — the unclear lines are saved for your advisor and will come back next time."
+        : "Fully checked — everything accounted for.");
+      viewBank();
+    } catch(e){ err(e); }
+  };
 }
 
 // ════════ Payments register + voids (Spec 03 §6) ════════
