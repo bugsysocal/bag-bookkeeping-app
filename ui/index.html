@@ -25,6 +25,11 @@
   .chip.draft { background:#f1f5f9; color:#475569; } .chip.void { background:#f1f5f9; color:#94a3b8; text-decoration:line-through; }
   a.navlink { color:var(--green); cursor:pointer; text-decoration:none; font-weight:600; margin-right:14px; }
   tr.rowlink:hover td { background:#f8faf8; cursor:pointer; }
+  @media print { /* the document view prints clean; system dialog's PDF printer = Save as PDF (Spec 03 §7) */
+    header, .toolbar, .no-print, #toast, #err { display:none !important; }
+    body { background:#fff; } main { margin:0; max-width:none; }
+    .card { box-shadow:none; border-radius:0; padding:0; }
+  }
   button { background:var(--green); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:15px; cursor:pointer; }
   button.ghost { background:#fff; color:var(--green); border:1px solid var(--green); }
   button:disabled { opacity:.45; cursor:default; }
@@ -327,18 +332,26 @@ const today = () => new Date().toISOString().slice(0,10);
 const dmy = iso => iso ? `${iso.slice(8,10)}/${iso.slice(5,7)}/${iso.slice(0,4)}` : "";
 const VAT_BP = 750;                 // display estimate only — the engine's numbers are the truth
 
-// Three primary actions, always visible (Spec 07 §2.2); Record Expense lands with Spec 04 UI.
+// Three primary actions, always visible (Spec 07 §2.2).
 function chrome(active, body){
   el("main").innerHTML = `
-    <div class="toolbar">
+    <div class="toolbar no-print">
       <a class="navlink" id="n-home">Home</a>
-      <a class="navlink" id="n-inv">Invoices</a>
+      <a class="navlink" id="n-inv">Sales</a>
+      <a class="navlink" id="n-pur">Purchases</a>
+      <a class="navlink" id="n-bank">Bank &amp; Cash</a>
+      <a class="navlink" id="n-pays">Payments</a>
       <span class="spacer"></span>
       <button id="a-newinv">New Invoice</button>
+      <button class="ghost" id="a-exp">Record Expense</button>
       <button class="ghost" id="a-pay">Record Payment</button>
     </div>${body}<div id="err"></div>`;
   el("n-home").onclick = viewDashboard; el("n-inv").onclick = viewInvoices;
-  el("a-newinv").onclick = viewNewInvoice; el("a-pay").onclick = () => viewRecordPayment();
+  el("n-pur").onclick = viewPurchases; el("n-bank").onclick = viewBank;
+  el("n-pays").onclick = viewPayments;
+  el("a-newinv").onclick = () => viewNewInvoice(false);
+  el("a-exp").onclick = viewRecordExpense;
+  el("a-pay").onclick = () => viewRecordPayment();
 }
 
 async function viewDashboard(){
@@ -355,19 +368,96 @@ async function viewDashboard(){
   el("t-owes").onclick = viewInvoices;
 }
 
-// ── Invoice register (Spec 03 §2; Overdue derived, shown as chip, never stored)
+// ── Sales register: invoices + quotes (Spec 03 §2/§3; Overdue derived, never stored)
 async function viewInvoices(){
   const rows = await invoke("list_invoices",{companyId:CO.id});
-  const body = rows.length ? `<div class="card"><h3>Invoices</h3><table>
-      <tr><th>Number</th><th>Customer</th><th>Date</th><th>Due</th><th>Status</th><th>Total</th><th>Still owed</th></tr>
+  const body = rows.length ? `<div class="card"><h3>Sales — invoices &amp; quotes</h3>
+      <button class="ghost" id="newquote" style="float:right;margin-top:-34px">New quote</button>
+      <table>
+      <tr><th>Number</th><th>Customer</th><th>Date</th><th>Status</th><th>Total</th><th>Still owed</th><th></th></tr>
       ${rows.map(r=>{
         const chip = r.overdue ? "overdue" : r.status;
-        const label = r.overdue ? "Overdue" : ({draft:"Draft",sent:"Sent",partially_paid:"Part-paid",paid:"Paid",void:"Cancelled"}[r.status]||r.status);
-        return `<tr><td>${esc(r.number)}</td><td>${esc(r.customer)}</td><td>${dmy(r.issue_date)}</td><td>${dmy(r.due_date)}</td>
-          <td><span class="chip ${chip}">${label}</span></td><td>${naira(r.total_kobo)}</td><td>${naira(r.total_kobo-r.paid_kobo)}</td></tr>`;
+        const label = r.kind==="quote"
+          ? ({draft:"Quote",sent:"Quote sent",converted:"Became invoice",void:"Cancelled"}[r.status]||r.status)
+          : (r.overdue ? "Overdue" : ({draft:"Draft",sent:"Sent",partially_paid:"Part-paid",paid:"Paid",void:"Cancelled"}[r.status]||r.status));
+        const acts = [];
+        if (r.status!=="void") acts.push(`<a class="navlink" data-act="doc" data-id="${r.id}">View</a>`);
+        if (r.kind==="invoice" && r.status==="draft") acts.push(`<a class="navlink" data-act="send" data-id="${r.id}">Send</a>`);
+        if (r.kind==="quote" && (r.status==="draft"||r.status==="sent")) acts.push(`<a class="navlink" data-act="convert" data-id="${r.id}">Make invoice</a>`);
+        if (r.status!=="void" && r.status!=="converted" && r.paid_kobo===0) acts.push(`<a class="navlink" data-act="void" data-id="${r.id}" data-n="${esc(r.number)}">Cancel</a>`);
+        return `<tr><td>${esc(r.number)}</td><td>${esc(r.customer)}</td><td>${dmy(r.issue_date)}</td>
+          <td><span class="chip ${chip}">${label}</span></td><td>${naira(r.total_kobo)}</td>
+          <td>${r.kind==="quote"?"—":naira(r.total_kobo-r.paid_kobo)}</td><td>${acts.join(" ")}</td></tr>`;
       }).join("")}</table></div>`
-    : `<div class="card"><h3>Invoices</h3><div class="mut">No invoices yet — create your first with the button above.</div></div>`;
+    : `<div class="card"><h3>Sales</h3><div class="mut">No invoices yet — create your first with the button above.</div>
+       <button class="ghost" id="newquote">New quote</button></div>`;
   chrome("inv", body);
+  el("newquote") && (el("newquote").onclick = () => viewNewInvoice(true));
+  document.querySelectorAll("[data-act]").forEach(a => a.onclick = async () => {
+    const id = a.dataset.id;
+    try {
+      if (a.dataset.act==="doc") return viewDoc(id);
+      if (a.dataset.act==="send"){ await invoke("send_invoice",{invoiceId:id, confirmSoftClose:false}); toast("Sent — it's now in your books."); }
+      if (a.dataset.act==="convert"){ const d = await invoke("convert_quote_cmd",{quoteId:id}); toast(`Quote became draft invoice ${d.number} — review and send it.`); }
+      if (a.dataset.act==="void"){
+        if (!window.confirm(`Cancel ${a.dataset.n}? It stays in your records, marked as cancelled — nothing is ever deleted.`)) return;
+        await invoke("void_invoice_cmd",{invoiceId:id, confirmSoftClose:false}); toast(`${a.dataset.n} cancelled.`);
+      }
+      viewInvoices();
+    } catch(e){ err(e); }
+  });
+}
+
+// ── Printable document view (Spec 03 §7): print via the system dialog
+//    ("Microsoft Print to PDF" gives the PDF); WhatsApp opens wa.me prefilled.
+async function viewDoc(id){
+  const d = await invoke("invoice_doc",{invoiceId:id});
+  const title = d.kind==="quote" ? "QUOTE" : "INVOICE";
+  chrome("doc", `<div class="card" id="printdoc">
+    <div style="display:flex;justify-content:space-between">
+      <div><h3 style="font-size:22px">${esc(d.company_name)}</h3>
+        ${d.company_tin?`<div class="mut">TIN: ${esc(d.company_tin)}</div>`:""}</div>
+      <div style="text-align:right"><div style="font-size:20px;font-weight:700">${title} ${esc(d.number)}</div>
+        <div class="mut">Date: ${dmy(d.issue_date)}<br>Payment due: ${dmy(d.due_date)}</div></div>
+    </div>
+    <div style="margin:14px 0"><b>To:</b> ${esc(d.customer)}${d.customer_phone?` · ${esc(d.customer_phone)}`:""}</div>
+    <table><tr><th>Item</th><th>Qty</th><th>Price</th><th>Amount</th></tr>
+      ${d.lines.map(l=>`<tr><td>${esc(l.description)}</td><td>${(l.quantity_milli/1000).toLocaleString()}</td>
+        <td>${naira(l.unit_price_kobo)}</td><td>${naira(l.net_kobo)}</td></tr>`).join("")}
+      <tr><td colspan="3" style="text-align:right">Subtotal</td><td>${naira(d.subtotal_kobo)}</td></tr>
+      ${d.vat_kobo>0?`<tr><td colspan="3" style="text-align:right">VAT (7.5%)</td><td>${naira(d.vat_kobo)}</td></tr>`:""}
+      <tr><td colspan="3" style="text-align:right"><b>Total</b></td><td><b>${naira(d.total_kobo)}</b></td></tr>
+      ${d.paid_kobo>0?`<tr><td colspan="3" style="text-align:right">Paid so far</td><td>${naira(d.paid_kobo)}</td></tr>
+      <tr><td colspan="3" style="text-align:right"><b>Balance</b></td><td><b>${naira(d.total_kobo-d.paid_kobo)}</b></td></tr>`:""}
+    </table>
+    ${d.bank_details.length?`<div style="margin-top:14px" class="mut"><b>Pay into:</b> ${d.bank_details.map(esc).join(" · ")}</div>`:""}
+    <div class="nav no-print">
+      <button class="ghost" id="backreg">Back</button>
+      <span>
+        <button class="ghost" id="doprint">Print / Save PDF</button>
+        ${d.customer_phone?`<button id="dowa">Share on WhatsApp</button>`:""}
+      </span>
+    </div></div>`);
+  el("backreg").onclick = viewInvoices;
+  el("doprint").onclick = async () => {
+    try { await invoke("log_delivery",{companyId:CO.id, docType:d.kind, docId:id, channel:"print", recipient:null}); } catch(_){}
+    window.print();
+  };
+  const wa = el("dowa");
+  if (wa) wa.onclick = async () => {
+    let ph = (d.customer_phone||"").replace(/[^\d+]/g,"");
+    if (ph.startsWith("0")) ph = "+234" + ph.slice(1);      // E.164 normalize (Spec 03 §7)
+    const bal = d.total_kobo - d.paid_kobo;
+    const msg = encodeURIComponent(
+      `Hello ${d.customer},\n${title.toLowerCase()==="quote"?"Your quote":"Your invoice"} ${d.number} from ${d.company_name}: ${naira(d.total_kobo)}`
+      + (d.kind==="invoice" ? `, due ${dmy(d.due_date)}. Balance: ${naira(bal)}.` : ".")
+      + `\nThank you!`);
+    try {
+      await window.__TAURI__.opener.openUrl(`https://wa.me/${ph.replace("+","")}?text=${msg}`);
+      await invoke("log_delivery",{companyId:CO.id, docType:d.kind, docId:id, channel:"whatsapp", recipient:ph});
+      toast("WhatsApp opened with the message ready — use Print / Save PDF to attach the document.");
+    } catch(e){ err(e); }
+  };
 }
 
 // ── Customer picker with inline create (Spec 07 §6: real deduped record, never free text)
@@ -395,9 +485,9 @@ function wirePicker(sel, onCreated){
   };
 }
 
-// ── New invoice (Spec 03 §4) — free-description lines; VAT per line; totals are estimates,
-//    frozen server-side at posting (engine rounding is normative).
-function viewNewInvoice(){
+// ── New invoice or quote (Spec 03 §4/§3) — free-description lines; VAT per line;
+//    totals are estimates, frozen server-side at posting (engine rounding is normative).
+function viewNewInvoice(isQuote){
   customerPicker("cust").then(pickerHtml => {
     const L = [{d:"",q:"1",p:"",disc:"0",vat:true}];
     const linesHtml = () => L.map((l,i)=>`<tr>
@@ -425,17 +515,19 @@ function viewNewInvoice(){
     };
     const sums = () => { const t = totals();
       el("sums").innerHTML = `Subtotal ${naira(t.net)} · VAT ${naira(t.vat)} · <b>Total ${naira(t.total)}</b> <span class="mut">(final figures set when you send)</span>`; };
-    chrome("newinv", `<div class="card"><h3>New invoice</h3>${pickerHtml}
-      <div class="row"><div><label>Invoice date</label><input type="date" id="f-issue" value="${today()}"/></div>
-      <div><label>Payment due by</label><input type="date" id="f-due" value="${today()}"/></div></div>
+    chrome("newinv", `<div class="card"><h3>${isQuote?"New quote":"New invoice"}</h3>
+      ${isQuote?`<div class="mut">A quote is a price offer — it never touches your books. Convert it to an invoice when the customer agrees.</div>`:""}
+      ${pickerHtml}
+      <div class="row"><div><label>${isQuote?"Quote date":"Invoice date"}</label><input type="date" id="f-issue" value="${today()}"/></div>
+      <div><label>${isQuote?"Valid until":"Payment due by"}</label><input type="date" id="f-due" value="${today()}"/></div></div>
       <table><tr><th>Item</th><th>Qty</th><th>Price (₦)</th><th>Discount %</th><th>VAT</th></tr>
         <tbody id="lines"></tbody></table>
       <button class="ghost" id="addline" style="margin-top:8px">+ Add line</button>
       <div class="ok" id="sums" style="margin-top:14px"></div>
       <div class="nav"><button class="ghost" id="saveDraft">Save for later</button>
-        <button id="saveSend">Save &amp; send</button></div></div>`);
+        ${isQuote?"<span></span>":`<button id="saveSend">Save &amp; send</button>`}</div></div>`);
     paint();
-    wirePicker("cust", c => { viewNewInvoice(); });
+    wirePicker("cust", c => { viewNewInvoice(isQuote); });
     el("addline").onclick = () => { L.push({d:"",q:"1",p:"",disc:"0",vat:true}); paint(); };
     const collect = () => {
       const contact = el("cust").value;
@@ -444,13 +536,16 @@ function viewNewInvoice(){
         description:l.d.trim(), quantity_milli:Math.round(parseFloat(l.q||"0")*1000),
         unit_price_kobo:kobo(l.p), discount_bp:Math.round(parseFloat(l.disc||"0")*100), vat_applied:!!l.vat }));
       if (!lines.length) throw {message:"Add at least one line — what are you selling?"};
-      return { company_id:CO.id, contact_id:contact, issue_date:el("f-issue").value, due_date:el("f-due").value, lines };
+      return { company_id:CO.id, contact_id:contact, issue_date:el("f-issue").value, due_date:el("f-due").value,
+               lines, kind: isQuote ? "quote" : "invoice" };
     };
     el("saveDraft").onclick = async () => {
-      try { const d = await invoke("create_invoice_draft",{input:collect()}); toast(`Saved as a draft — ${d.number}.`); viewInvoices(); }
+      try { const d = await invoke("create_invoice_draft",{input:collect()});
+        toast(isQuote ? `Quote ${d.number} saved.` : `Saved as a draft — ${d.number}.`); viewInvoices(); }
       catch(e){ err(e); }
     };
-    el("saveSend").onclick = async () => {
+    const ss = el("saveSend");
+    if (ss) ss.onclick = async () => {
       try { const d = await invoke("create_invoice_draft",{input:collect()});
         await invoke("send_invoice",{invoiceId:d.id, confirmSoftClose:false});
         toast(`${d.number} sent — it's now in your books.`); viewInvoices(); }
@@ -523,6 +618,277 @@ function viewRecordPayment(){
         viewInvoices();
       } catch(e){ err(e); }
     };
+  });
+}
+
+// ════════ Purchases (Spec 04 §2–3) ════════
+
+async function viewPurchases(){
+  const rows = await invoke("list_bills",{companyId:CO.id});
+  const body = `<div class="card"><h3>Purchases — bills you owe</h3>
+    <div class="toolbar" style="margin:8px 0 4px">
+      <button id="newbill">New supplier bill</button>
+      <button class="ghost" id="paysup">Pay a supplier</button>
+    </div>
+    ${rows.length ? `<table>
+      <tr><th>Supplier</th><th>Their ref</th><th>Date</th><th>Due</th><th>Status</th><th>Total</th><th>Still owed</th></tr>
+      ${rows.map(r=>{
+        const chip = r.overdue ? "overdue" : ({open:"sent",partially_paid:"partially_paid",paid:"paid",draft:"draft",void:"void"}[r.status]||r.status);
+        const label = r.overdue ? "Overdue" : ({open:"To pay",partially_paid:"Part-paid",paid:"Paid",draft:"Draft",void:"Cancelled"}[r.status]||r.status);
+        return `<tr><td>${esc(r.supplier)}</td><td>${esc(r.reference||"")}</td><td>${dmy(r.bill_date)}</td><td>${dmy(r.due_date)}</td>
+          <td><span class="chip ${chip}">${label}</span></td><td>${naira(r.total_kobo)}</td><td>${naira(r.total_kobo-r.paid_kobo)}</td></tr>`;
+      }).join("")}</table>`
+      : `<div class="mut">No supplier bills yet. Quick one-off costs go through <b>Record Expense</b>; bills you'll pay later are recorded here.</div>`}
+    </div>`;
+  chrome("pur", body);
+  el("newbill").onclick = viewNewBill;
+  el("paysup").onclick = viewPaySupplier;
+}
+
+// ── Quick expense (Spec 04 §2): paid now, no supplier account needed
+async function viewRecordExpense(){
+  const [cats, banks] = await Promise.all([
+    invoke("expense_categories",{companyId:CO.id}),
+    invoke("list_bank_accounts",{companyId:CO.id}),
+  ]);
+  chrome("exp", `<div class="card"><h3>Record money out</h3>
+    <div class="mut">For things you paid on the spot. If you'll pay later, use Purchases → New supplier bill.</div>
+    <div class="row">
+      <div><label>Who did you pay?</label><input type="text" id="f-payee" placeholder="e.g. NEPA, fuel station, landlord"/></div>
+      <div><label>What was it for?</label><select id="f-cat">${cats.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select></div>
+    </div>
+    <div class="row">
+      <div><label>Amount paid (₦)</label><input type="text" id="f-amt" placeholder="0.00" style="text-align:right"/></div>
+      <div><label>Paid from</label><select id="f-bank">${banks.map(b=>`<option value="${b.id}">${esc(b.label)}</option>`).join("")}</select></div>
+      <div><label>Date</label><input type="date" id="f-date" value="${today()}"/></div>
+    </div>
+    <label style="font-weight:400;margin-top:10px"><input type="checkbox" id="f-vat" checked/> The price includes 7.5% VAT</label>
+    <details style="margin-top:8px"><summary class="mut">Held back tax from this payment (WHT)?</summary>
+      <label>Amount held back (₦)</label><input type="text" id="f-wht" placeholder="0.00" style="max-width:200px;text-align:right"/>
+    </details>
+    <div class="nav"><span></span><button id="save">Save</button></div></div>`);
+  el("save").onclick = async () => {
+    try {
+      await invoke("record_expense",{input:{
+        company_id:CO.id, bank_account_id:el("f-bank").value, payee:el("f-payee").value.trim()||"(no name)",
+        expense_account_id:el("f-cat").value, date:el("f-date").value,
+        gross_kobo:kobo(el("f-amt").value), vat_inclusive:el("f-vat").checked,
+        wht_kobo:kobo(el("f-wht").value), confirm_soft_close:false }});
+      toast("Money out recorded."); viewDashboard();
+    } catch(e){ err(e); }
+  };
+}
+
+// ── New supplier bill (Spec 04 §2): posts on save (Dr cost / Cr what-you-owe)
+async function viewNewBill(){
+  const [cats, presets] = await Promise.all([
+    invoke("expense_categories",{companyId:CO.id}),
+    invoke("wht_presets",{companyId:CO.id}),
+  ]);
+  const sup = await supplierPicker("sup");
+  const L = [{d:"",q:"1",p:"",vat:false}];
+  const paint = () => {
+    el("blines").innerHTML = L.map((l,i)=>`<tr>
+      <td style="width:30%"><input type="text" data-i="${i}" data-k="d" value="${esc(l.d)}" placeholder="What did you buy?"/></td>
+      <td><input type="text" data-i="${i}" data-k="q" value="${esc(l.q)}" style="text-align:right"/></td>
+      <td><input type="text" data-i="${i}" data-k="p" value="${esc(l.p)}" placeholder="0.00" style="text-align:right"/></td>
+      <td><select data-i="${i}" data-k="cat">${cats.map(c=>`<option value="${c.id}" ${l.cat===c.id?"selected":""}>${esc(c.name)}</option>`).join("")}</select></td>
+      <td style="text-align:center"><input type="checkbox" data-i="${i}" data-k="vat" ${l.vat?"checked":""}/></td>
+    </tr>`).join("");
+    document.querySelectorAll("#blines [data-i]").forEach(inp => inp.onchange = e => {
+      L[+e.target.dataset.i][e.target.dataset.k] = e.target.type==="checkbox" ? e.target.checked : e.target.value; });
+  };
+  chrome("newbill", `<div class="card"><h3>New supplier bill</h3>${sup}
+    <div class="row">
+      <div><label>Their invoice number <span class="mut">(optional)</span></label><input type="text" id="f-ref"/></div>
+      <div><label>Bill date</label><input type="date" id="f-bdate" value="${today()}"/></div>
+      <div><label>Pay by</label><input type="date" id="f-bdue" value="${today()}"/></div>
+    </div>
+    <table><tr><th>Item</th><th>Qty</th><th>Cost (₦)</th><th>Category</th><th>VAT charged</th></tr>
+      <tbody id="blines"></tbody></table>
+    <button class="ghost" id="addbl" style="margin-top:8px">+ Add line</button>
+    <details style="margin-top:10px"><summary class="mut">Tax to hold back when paying (WHT)?</summary>
+      <label>Type of payment</label>
+      <select id="f-whtrate" style="max-width:340px">
+        <option value="">No — pay in full</option>
+        ${presets.map(p=>`<option value="${p.rate_bp}">${esc(p.label)} (${(p.rate_bp/100).toFixed(1)}%)</option>`).join("")}
+      </select>
+      <div class="mut">If it applies, LedgerOne works out the deduction when you actually pay — including the small-company exemption.</div>
+    </details>
+    <div class="nav"><span></span><button id="saveb">Save bill</button></div></div>`);
+  paint();
+  wireSupplierPicker("sup", () => viewNewBill());
+  el("addbl").onclick = () => { L.push({d:"",q:"1",p:"",vat:false}); paint(); };
+  el("saveb").onclick = async () => {
+    try {
+      const cid = el("sup").value; if (!cid) return err({message:"Please choose a supplier first."});
+      const rate = el("f-whtrate").value;
+      const lines = L.filter(l=>l.d.trim()).map(l=>({
+        description:l.d.trim(), quantity_milli:Math.round(parseFloat(l.q||"0")*1000),
+        unit_cost_kobo:kobo(l.p), vat_charged:!!l.vat, vat_claimable:!!l.vat,
+        expense_account_id:l.cat || cats[0].id }));
+      if (!lines.length) return err({message:"Add at least one line — what did you buy?"});
+      await invoke("create_bill",{input:{
+        company_id:CO.id, contact_id:cid, bill_date:el("f-bdate").value, due_date:el("f-bdue").value,
+        wht_applicable:!!rate, wht_rate_bp:rate?+rate:null, lines, confirm_soft_close:false }});
+      toast("Bill saved — it's on your Purchases list until you pay it."); viewPurchases();
+    } catch(e){ err(e); }
+  };
+}
+
+async function supplierPicker(sel){
+  const cs = await invoke("list_contacts",{companyId:CO.id, kind:"supplier"});
+  return `<label>Supplier</label>
+    <div class="row"><select id="${sel}"><option value="">— choose —</option>
+      ${cs.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select>
+      <div style="max-width:170px"><button class="ghost" id="${sel}-new" style="width:100%">+ New supplier</button></div></div>
+    <div id="${sel}-form" style="display:none">
+      <div class="row"><div><label>Name</label><input type="text" id="${sel}-nm"/></div>
+      <div><label>Phone</label><input type="text" id="${sel}-ph"/></div>
+      <div><label>TIN <span class="mut">(matters for tax on payments)</span></label><input type="text" id="${sel}-tin"/></div></div>
+      <button class="ghost" id="${sel}-save" style="margin-top:8px">Save supplier</button></div>`;
+}
+function wireSupplierPicker(sel, onCreated){
+  el(`${sel}-new`).onclick = () => el(`${sel}-form`).style.display = "";
+  el(`${sel}-save`).onclick = async () => {
+    try {
+      const c = await invoke("create_contact",{companyId:CO.id, name:el(`${sel}-nm`).value,
+        phone:el(`${sel}-ph`).value||null, kind:"supplier"});
+      // TIN entered inline rides a follow-up update once a dedicated command exists;
+      // for now the advisor can add it — the engine treats missing TIN conservatively (2× decision).
+      onCreated(c);
+    } catch(e){ err(e); }
+  };
+}
+
+// ── Pay a supplier (Spec 04 §3): FIFO allocations; WHT auto with the exemption;
+//    a no-TIN supplier surfaces the explicit 2× decision, never silent.
+async function viewPaySupplier(){
+  const sup = await supplierPicker("ps");
+  const banks = await invoke("list_bank_accounts",{companyId:CO.id});
+  chrome("paysup", `<div class="card"><h3>Pay a supplier</h3>${sup}
+    <div class="row">
+      <div><label>Paid from</label><select id="f-bank">${banks.map(b=>`<option value="${b.id}">${esc(b.label)}</option>`).join("")}</select></div>
+      <div><label>Date</label><input type="date" id="f-date" value="${today()}"/></div>
+    </div>
+    <div id="billwrap"></div>
+    <div class="ok" id="paysum" style="display:none"></div>
+    <div id="whtdecide" style="display:none" class="error"></div>
+    <div class="nav"><span></span><button id="dopay">Pay</button></div></div>`);
+  let whtOverride = null; // null = auto; {mode:"manual", amount} | {mode:"off"}
+  const allocs = () => [...document.querySelectorAll("[data-balloc]")].map(inp => ({
+    invoice_id: inp.dataset.balloc, amount_kobo: kobo(inp.value) })).filter(a=>a.amount_kobo>0);
+  const loadBills = async () => {
+    whtOverride = null; el("whtdecide").style.display = "none";
+    const cid = el("ps").value; if (!cid){ el("billwrap").innerHTML=""; return; }
+    const bills = await invoke("open_bills",{companyId:CO.id, contactId:cid});
+    el("billwrap").innerHTML = bills.length ? `<table>
+        <tr><th>Bill</th><th>Due</th><th>Still owed</th><th>Pay off (₦)</th></tr>
+        ${bills.map(b=>`<tr><td>${esc(b.reference||"(no ref)")}${b.wht_applicable?' <span class="mut">· tax may apply</span>':""}</td>
+          <td>${dmy(b.due_date)}</td><td>${naira(b.balance_kobo)}</td>
+          <td><input type="text" data-balloc="${b.id}" value="${(b.balance_kobo/100).toFixed(2)}" style="text-align:right"/></td></tr>`).join("")}
+      </table>`
+      : `<div class="mut" style="margin-top:10px">No unpaid bills for this supplier.</div>`;
+  };
+  el("ps").onchange = loadBills;
+  wireSupplierPicker("ps", () => viewPaySupplier());
+  el("dopay").onclick = async () => {
+    const cid = el("ps").value; if (!cid) return err({message:"Please choose a supplier first."});
+    const a = allocs(); if (!a.length) return err({message:"Enter how much of which bill you're paying."});
+    const base = { company_id:CO.id, contact_id:cid, bank_account_id:el("f-bank").value,
+      payment_date:el("f-date").value, allocations:a, confirm_soft_close:false };
+    const input = whtOverride===null ? {...base, wht_mode:"auto", wht_manual_kobo:null}
+      : whtOverride.mode==="off" ? {...base, wht_mode:"off", wht_manual_kobo:null}
+      : {...base, wht_mode:"manual", wht_manual_kobo:whtOverride.amount};
+    try {
+      const res = await invoke("record_payment_out",{input});
+      toast(res.wht_kobo>0
+        ? `Paid. ${naira(res.wht_kobo)} held back as tax — remember it goes to FIRS, not to you.`
+        : "Supplier paid in full — no tax deduction needed.");
+      viewPurchases();
+    } catch(e){
+      if (e && e.code === "wht_decision"){
+        // The engine refused to decide silently (Spec 01 §6.2). Put the decision on screen.
+        const w = el("whtdecide"); w.style.display = "";
+        w.innerHTML = `${esc(e.message)}<div class="row" style="margin-top:10px">
+          <div><label>Hold back this much (₦)</label><input type="text" id="whtamt" style="text-align:right"/></div>
+          <div style="display:flex;align-items:flex-end;gap:8px">
+            <button id="whtgo">Pay with this deduction</button>
+            <button class="ghost" id="whtnone">No deduction</button></div></div>`;
+        el("whtgo").onclick = () => { whtOverride = {mode:"manual", amount:kobo(el("whtamt").value)}; el("dopay").click(); };
+        el("whtnone").onclick = () => { whtOverride = {mode:"off"}; el("dopay").click(); };
+      } else err(e);
+    }
+  };
+}
+
+// ════════ Bank & Cash (Spec 04 §5): balances, Move Money, owner in/out ════════
+
+async function viewBank(){
+  const [dd, banks] = await Promise.all([
+    invoke("dashboard",{companyId:CO.id}),
+    invoke("list_bank_accounts",{companyId:CO.id}),
+  ]);
+  const opts = banks.map(b=>`<option value="${b.id}">${esc(b.label)}</option>`).join("");
+  chrome("bank", `<div class="card"><h3>Bank &amp; Cash</h3>
+    <table>${dd.cash_accounts.map(a=>`<tr><td>${esc(a.label)}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("")}
+      <tr><td><b>Total</b></td><td><b>${naira(dd.cash_total_kobo)}</b></td></tr></table>
+    <h3 style="margin-top:22px">Move money between accounts</h3>
+    <div class="mut">Moving your own money is never income or a cost — LedgerOne records it correctly.</div>
+    <div class="row">
+      <div><label>From</label><select id="t-from">${opts}</select></div>
+      <div><label>To</label><select id="t-to">${opts}</select></div>
+      <div><label>Amount (₦)</label><input type="text" id="t-amt" placeholder="0.00" style="text-align:right"/></div>
+      <div><label>Bank charge (₦)</label><input type="text" id="t-fee" placeholder="0.00" style="text-align:right"/></div>
+    </div>
+    <div class="nav"><span></span><button id="dotransfer">Move money</button></div>
+    <h3 style="margin-top:22px">Owner's money</h3>
+    <div class="row">
+      <div><label>Account</label><select id="d-bank">${opts}</select></div>
+      <div><label>Amount (₦)</label><input type="text" id="d-amt" placeholder="0.00" style="text-align:right"/></div>
+      <div style="display:flex;align-items:flex-end;gap:8px">
+        <button class="ghost" id="d-out">I took money out</button>
+        <button class="ghost" id="d-in">I put money in</button></div>
+    </div></div>`);
+  el("dotransfer").onclick = async () => {
+    try {
+      await invoke("record_transfer",{input:{ company_id:CO.id, from_bank_id:el("t-from").value,
+        to_bank_id:el("t-to").value, date:today(), amount_kobo:kobo(el("t-amt").value),
+        fee_kobo:kobo(el("t-fee").value), confirm_soft_close:false }});
+      toast("Money moved."); viewBank();
+    } catch(e){ err(e); }
+  };
+  const drawing = out => async () => {
+    try {
+      await invoke("record_drawing",{ companyId:CO.id, bankAccountId:el("d-bank").value,
+        date:today(), amountKobo:kobo(el("d-amt").value), out, confirmSoftClose:false });
+      toast(out ? "Recorded — kept separate from business costs, as it should be."
+                : "Recorded as money you put into the business.");
+      viewBank();
+    } catch(e){ err(e); }
+  };
+  el("d-out").onclick = drawing(true);
+  el("d-in").onclick = drawing(false);
+}
+
+// ════════ Payments register + voids (Spec 03 §6) ════════
+
+async function viewPayments(){
+  const rows = await invoke("list_payments",{companyId:CO.id});
+  const body = rows.length ? `<div class="card"><h3>Payments</h3><table>
+      <tr><th>Date</th><th></th><th>Who</th><th>Account</th><th>Amount</th><th>Receipt</th><th></th></tr>
+      ${rows.map(p=>`<tr ${p.voided?'style="opacity:.45;text-decoration:line-through"':""}>
+        <td>${dmy(p.payment_date)}</td><td>${p.direction==="in"?"In":"Out"}</td>
+        <td>${esc(p.contact||"")}</td><td>${esc(p.bank)}</td><td>${naira(p.amount_kobo)}</td>
+        <td>${esc(p.receipt_number||"")}</td>
+        <td>${p.voided?"":`<a class="navlink" data-vp="${p.id}">Cancel</a>`}</td></tr>`).join("")}
+    </table></div>`
+    : `<div class="card"><h3>Payments</h3><div class="mut">Nothing here yet.</div></div>`;
+  chrome("pays", body);
+  document.querySelectorAll("[data-vp]").forEach(a => a.onclick = async () => {
+    if (!window.confirm("Cancel this payment? The money goes back to owing on the invoice or bill it paid — nothing is deleted.")) return;
+    try { await invoke("void_payment_cmd",{paymentId:a.dataset.vp, confirmSoftClose:false});
+      toast("Payment cancelled."); viewPayments(); } catch(e){ err(e); }
   });
 }
 

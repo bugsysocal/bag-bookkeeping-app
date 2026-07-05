@@ -53,7 +53,7 @@ A **click-through EULA/disclaimer screen precedes the setup wizard** on first ru
 2. **Updater keypair generated before first client install; private key custody = practice password manager, offline.** (§2)
 3. **v1 license key = stored identifier, offline, unvalidated; format fixed now for v2 signed payloads; advisory-bundled default.** (§3)
 4. **Isolation model as stated** — OS profile is the on-machine boundary; command-layer company scoping; no vendor-side data, ever. (§4)
-5. ⚠️ **NDPA flags (§5)** — confirm the three postures, especially the cross-border sentence on the Spec 09 consent screen and the processor clause living in the engagement letter rather than the app. (§5)
+5. ✅ **NDPA flags (§5) — CONFIRMED by reviewer** (recorded 2026-07-04 at reviewer's direction): all three postures stand — local-first/zero-telemetry as the privacy posture; processor clause lives in the engagement letter, not the app; cross-border plain-language sentence goes on the Spec 09 consent screen at implementation. (§5)
 6. **First-run EULA gate as specified** — click-through before wizard, audit-log acceptance record, re-gate on version change; text pending legal review. (§5b)
 
 ---

@@ -803,6 +803,71 @@ fn create_company_full_is_atomic_with_obe_plug() {
     assert_eq!(n, 0);
 }
 
+// ===== Quote conversion (Spec 03 §3) =====
+
+#[test]
+fn quote_converts_once_lines_verbatim_and_never_posts() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    let quote = create_invoice(
+        &mut w.conn, &w.company, &w.customer, "quote", "2026-07-04", "2026-07-18",
+        &[line("Cement, 50 bags", 50_000, 9_500_00, true)],
+        &ctx,
+    ).unwrap();
+    // Quotes never post.
+    assert!(post_invoice(&mut w.conn, quote.as_str(), &ctx).is_err());
+
+    let inv = ledger_core::engine::convert_quote(&mut w.conn, &quote, &ctx).unwrap();
+    let (q_status, i_status, i_from, i_total): (String, String, Option<String>, i64) = w.conn.query_row(
+        "SELECT q.status, i.status, i.converted_from_id, i.total_kobo
+         FROM invoices q, invoices i WHERE q.id = ?1 AND i.id = ?2",
+        params![quote, inv], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).unwrap();
+    assert_eq!(q_status, "converted");
+    assert_eq!(i_status, "draft");
+    assert_eq!(i_from.as_deref(), Some(quote.as_str()));
+    // Quoted prices honored verbatim: 50 × 9,500 = 475,000 + 7.5% VAT = 510,625.
+    assert_eq!(i_total, 510_625_00);
+    // Terminal: converting again fails.
+    assert!(ledger_core::engine::convert_quote(&mut w.conn, &quote, &ctx).is_err());
+}
+
+// ===== Payment void (Spec 03 §6) =====
+
+#[test]
+fn void_payment_walks_invoice_back_and_keeps_history() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    let inv = create_invoice(
+        &mut w.conn, &w.company, &w.customer, "invoice", "2026-07-04", "2026-07-18",
+        &[line("Goods", 1_000, 200_000_00, false)], &ctx,
+    ).unwrap();
+    post_invoice(&mut w.conn, inv.as_str(), &ctx).unwrap();
+    let pay = post_payment_in(
+        &mut w.conn, &w.company, &w.customer, &w.bank, "2026-07-04",
+        200_000_00, 0, &[Allocation { target_id: inv.clone(), amount_kobo: 200_000_00 }],
+        None, &ctx,
+    ).unwrap();
+    let st: String = w.conn.query_row(
+        "SELECT status FROM invoices WHERE id = ?1", params![inv], |r| r.get(0)).unwrap();
+    assert_eq!(st, "paid");
+
+    ledger_core::engine::void_payment(&mut w.conn, &pay.payment_id, "2026-07-04", &ctx).unwrap();
+    let (st, paid, voided, alloc_rows): (String, i64, i64, i64) = w.conn.query_row(
+        "SELECT i.status, i.amount_paid_kobo, p.voided,
+                (SELECT COUNT(*) FROM payment_allocations WHERE payment_id = p.id)
+         FROM invoices i, payments p WHERE i.id = ?1 AND p.id = ?2",
+        params![inv, pay.payment_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).unwrap();
+    assert_eq!(st, "sent", "invoice walks back from paid");
+    assert_eq!(paid, 0);
+    assert_eq!(voided, 1);
+    assert_eq!(alloc_rows, 1, "allocations stay as inactive history");
+    assert_eq!(trial_balance(&w.conn), 0);
+    // Double-void rejected.
+    assert!(ledger_core::engine::void_payment(&mut w.conn, &pay.payment_id, "2026-07-04", &ctx).is_err());
+}
+
 // ===== soft close (P4) =====
 
 #[test]

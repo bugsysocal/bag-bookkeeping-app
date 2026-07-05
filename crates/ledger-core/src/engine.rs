@@ -1274,6 +1274,107 @@ pub fn void_entry(
     Ok(rev_id)
 }
 
+/// Quote → invoice, one click (Spec 03 §3): fresh draft with a new INV number,
+/// lines copied verbatim (quoted prices honored), quote marked converted
+/// (terminal) and linked via converted_from_id. A quote converts at most once.
+pub fn convert_quote(conn: &mut Connection, quote_id: &str, ctx: &PostCtx) -> R<String> {
+    let (company_id, contact_id, status, kind): (String, String, String, String) = conn
+        .query_row(
+            "SELECT company_id, contact_id, status, kind FROM invoices WHERE id = ?1",
+            params![quote_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EngineError::Validation("unknown quote".into()))?;
+    if kind != "quote" {
+        return Err(EngineError::Validation("only quotes can be converted".into()));
+    }
+    if status == "converted" || status == "void" {
+        return Err(EngineError::Validation("this quote is no longer open".into()));
+    }
+    let mut lines = Vec::new();
+    {
+        let mut q = conn.prepare(
+            "SELECT product_id, description, quantity_milli, unit_price_kobo, discount_bp,
+                    vat_applied, income_account_id
+             FROM invoice_lines WHERE invoice_id = ?1 ORDER BY line_no",
+        )?;
+        let it = q.query_map(params![quote_id], |r| {
+            Ok(InvoiceLineInput {
+                product_id: r.get(0)?,
+                description: r.get(1)?,
+                quantity_milli: r.get(2)?,
+                unit_price_kobo: r.get(3)?,
+                discount_bp: r.get(4)?,
+                vat_applied: r.get::<_, i64>(5)? != 0,
+                income_account_id: r.get(6)?,
+            })
+        })?;
+        for l in it {
+            lines.push(l?);
+        }
+    }
+    let today = now_iso()[..10].to_string();
+    // create_invoice commits its own transaction; the linking updates follow. A crash
+    // between them leaves only a spare unposted draft (no ledger effect, deletable) —
+    // the quote stays open, so nothing financial can double-count.
+    let inv = create_invoice(conn, &company_id, &contact_id, "invoice", &today, &today, &lines, ctx)?;
+    conn.execute(
+        "UPDATE invoices SET converted_from_id = ?2 WHERE id = ?1",
+        params![inv, quote_id],
+    )?;
+    conn.execute(
+        "UPDATE invoices SET status = 'converted' WHERE id = ?1",
+        params![quote_id],
+    )?;
+    Ok(inv)
+}
+
+/// Void a payment (Spec 03 §6): reverse its entry, flag the row, recompute every
+/// document it touched. Allocations remain as inactive history (excluded from
+/// balances by the reversal + voided flag); a receipt number is never reused.
+pub fn void_payment(
+    conn: &mut Connection,
+    payment_id: &str,
+    reversal_date: &str,
+    ctx: &PostCtx,
+) -> R<String> {
+    let (company_id, entry_id, voided): (String, String, i64) = conn
+        .query_row(
+            "SELECT company_id, journal_entry_id, voided FROM payments WHERE id = ?1",
+            params![payment_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| EngineError::Validation("unknown payment".into()))?;
+    if voided != 0 {
+        return Err(EngineError::Validation("this payment is already cancelled".into()));
+    }
+    let c = cfg(conn, &company_id)?;
+    check_soft_close(&c, reversal_date, ctx)?;
+
+    let targets: Vec<(String, String)> = {
+        let mut q = conn.prepare(
+            "SELECT target_type, target_id FROM payment_allocations WHERE payment_id = ?1",
+        )?;
+        let it = q.query_map(params![payment_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        it.collect::<Result<_, _>>()?
+    };
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let rev = void_entry_in(&tx, &entry_id, reversal_date, ctx)?;
+    tx.execute("UPDATE payments SET voided = 1 WHERE id = ?1", params![payment_id])?;
+    for (tt, tid) in &targets {
+        if tt == "invoice" {
+            recompute_invoice_status(&tx, tid)?;
+        } else {
+            recompute_bill_status(&tx, tid)?;
+        }
+    }
+    tx.commit()?;
+    Ok(rev)
+}
+
 /// Document-level void (Spec 03 §6): blocked while money is attached; reverses
 /// the entry AND restores inventory at the ORIGINAL movement cost, not current WAC.
 pub fn void_invoice(
