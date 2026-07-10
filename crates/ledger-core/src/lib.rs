@@ -7,6 +7,7 @@
 
 pub use rusqlite; // single rusqlite version for all downstream crates
 
+pub mod auth;
 pub mod db;
 pub mod engine;
 pub mod recon;

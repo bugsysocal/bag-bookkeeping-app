@@ -25,6 +25,17 @@
   .chip.draft { background:#f1f5f9; color:#475569; } .chip.void { background:#f1f5f9; color:#94a3b8; text-decoration:line-through; }
   a.navlink { color:var(--green); cursor:pointer; text-decoration:none; font-weight:600; margin-right:14px; }
   tr.rowlink:hover td { background:#f8faf8; cursor:pointer; }
+  /* Session strip (Spec 07 §5): who's using it, and — when elevated — an
+     unmistakable badge. A screenshot must be unambiguous about mode. */
+  .sessionbar { display:flex; align-items:center; gap:10px; margin:0 0 10px; font-size:13px; color:var(--mut); }
+  .sessionbar .who { font-weight:600; color:var(--ink); }
+  .advisor-badge { background:#7c2d12; color:#fff; padding:3px 10px; border-radius:99px; font-size:12px; font-weight:700; letter-spacing:.3px; }
+  .sessionbar a.navlink { font-weight:500; font-size:13px; margin-right:10px; }
+  .pinbox { display:inline-flex; gap:6px; align-items:center; }
+  .pinbox input { width:120px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  .userpick { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
+  .userpick button { text-align:left; padding:14px 18px; }
+  .userpick .role { font-weight:400; opacity:.8; font-size:12px; }
   @media print { /* the document view prints clean; system dialog's PDF printer = Save as PDF (Spec 03 §7) */
     header, .toolbar, .no-print, #toast, #err { display:none !important; }
     body { background:#fff; } main { margin:0; max-width:none; }
@@ -321,20 +332,52 @@ function reviewStep(){
         opening_date: S.opening_date, owner_name:S.owner, staff_name:S.staff||null,
         advisor_pin: S.pin, eula_version: EULA_VERSION,
       }});
-      CO = co; viewDashboard();
+      CO = co;
+      // The wizard just signed the owner in server-side (Spec 07 §5: a session
+      // is established, not a second manual login step right after setup).
+      SESSION = await invoke("current_session");
+      viewDashboard();
     } catch(e){ el("next").disabled = false; err(e); }
   };
 }
 
 // ════════ App views (post-setup) ════════
 let CO = null;                      // active company {id, name}
+let SESSION = null;                 // {user_id, company_id, role, name, advisor_active}
 const today = () => new Date().toISOString().slice(0,10);
 const dmy = iso => iso ? `${iso.slice(8,10)}/${iso.slice(5,7)}/${iso.slice(0,4)}` : "";
 const VAT_BP = 750;                 // display estimate only — the engine's numbers are the truth
 
-// Three primary actions, always visible (Spec 07 §2.2).
+// ── Who's using LedgerOne? (Spec 07 §5: attribution, not a password gate —
+//    the PIN below is reserved for Advisor Mode elevation, never a login.)
+async function viewUserPicker(){
+  const users = await invoke("list_users",{companyId:CO.id});
+  const roleLabel = r => ({owner:"Owner", staff:"Accounts", advisor:"Advisor"}[r] || r);
+  el("main").innerHTML = `<div class="card">
+    <h3>Who's using LedgerOne?</h3>
+    <div class="mut">Pick your name so records show who entered what.</div>
+    <div class="userpick">${users.map(u=>
+      `<button class="ghost" data-u="${u.id}">${esc(u.name)} <span class="role">— ${roleLabel(u.role)}</span></button>`
+    ).join("")}</div>
+    <div id="err"></div></div>`;
+  document.querySelectorAll("[data-u]").forEach(b => b.onclick = async () => {
+    try { SESSION = await invoke("login",{userId:b.dataset.u}); viewDashboard(); }
+    catch(e){ err(e); }
+  });
+}
+
+// Three primary actions, always visible (Spec 07 §2.2), plus the session
+// strip every screen carries (Spec 07 §5: badge must be unambiguous).
 function chrome(active, body){
   el("main").innerHTML = `
+    <div class="sessionbar no-print">
+      <span class="who">${esc(SESSION?.name||"")}</span>
+      <span>(${esc(SESSION?.role||"")})</span>
+      ${SESSION?.advisor_active ? '<span class="advisor-badge">🔓 ADVISOR MODE</span>' : ""}
+      <span class="spacer"></span>
+      <span id="advisorctl"></span>
+      <a class="navlink" id="n-switch">Switch user</a>
+    </div>
     <div class="toolbar no-print">
       <a class="navlink" id="n-home">Home</a>
       <a class="navlink" id="n-inv">Sales</a>
@@ -352,6 +395,34 @@ function chrome(active, body){
   el("a-newinv").onclick = () => viewNewInvoice(false);
   el("a-exp").onclick = viewRecordExpense;
   el("a-pay").onclick = () => viewRecordPayment();
+  el("n-switch").onclick = async () => { await invoke("logout"); SESSION = null; viewUserPicker(); };
+  paintAdvisorControl(active, body);
+}
+
+// Staff never sees an elevation control at all (Spec 07 §5: eligible = owner/advisor).
+function paintAdvisorControl(active, body){
+  const box = el("advisorctl");
+  if (!box || !SESSION || SESSION.role === "staff") return;
+  if (SESSION.advisor_active){
+    box.innerHTML = `<a class="navlink" id="advisor-exit">Exit Advisor Mode</a>`;
+    el("advisor-exit").onclick = async () => {
+      try { await invoke("advisor_exit"); SESSION.advisor_active = false; chrome(active, body); }
+      catch(e){ err(e); }
+    };
+    return;
+  }
+  box.innerHTML = `<a class="navlink" id="advisor-open">Enter Advisor Mode</a>`;
+  el("advisor-open").onclick = () => {
+    box.innerHTML = `<span class="pinbox">
+      <input type="text" id="advisor-pin" maxlength="6" placeholder="6-digit PIN" inputmode="numeric"/>
+      <button id="advisor-go" style="padding:5px 12px">Unlock</button></span>`;
+    el("advisor-go").onclick = async () => {
+      try {
+        SESSION = await invoke("advisor_enter",{pin:el("advisor-pin").value});
+        chrome(active, body);
+      } catch(e){ err(e); }
+    };
+  };
 }
 
 async function viewDashboard(){
@@ -1042,9 +1113,14 @@ function toast(msg){
   clearTimeout(toastTimer); toastTimer = setTimeout(()=>{ t.style.display="none"; }, 5000);
 }
 
-// First run: EULA + wizard. Returning: straight to the dashboard.
-invoke("list_companies").then(cs => {
-  if (cs.length){ CO = cs[0]; viewDashboard(); } else render();
+// First run: EULA + wizard (which signs the owner in at the end). Returning
+// with no session yet this launch: pick who's using it (Spec 07 §5) — never
+// a password gate for ordinary attribution, just "who am I recording as."
+invoke("list_companies").then(async cs => {
+  if (!cs.length){ render(); return; }
+  CO = cs[0];
+  const session = await invoke("current_session").catch(() => null);
+  if (session){ SESSION = session; viewDashboard(); } else { viewUserPicker(); }
 }).catch(() => render());
 </script>
 </body>

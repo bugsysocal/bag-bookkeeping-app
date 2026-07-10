@@ -299,15 +299,9 @@ pub fn create_company_full(conn: &mut Connection, s: &FullSetup) -> Result<Strin
         }
     }
 
-    let pin_hash = {
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
-        use argon2::{Argon2, PasswordHasher};
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(s.advisor_pin.as_bytes(), &salt)
-            .map_err(|e| PostError::Validation(format!("PIN hashing failed: {e}")))?
-            .to_string()
-    };
+    // One hashing path, shared with the auth module that verifies it (Spec 07 §5).
+    let pin_hash = crate::auth::hash_pin(&s.advisor_pin)
+        .map_err(|e| PostError::Validation(e.to_string()))?;
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let company_id = create_company_in(&tx, &s.company)?;

@@ -4,6 +4,7 @@
 //! accrual/liability/equity in owner strings), recoverable, with the raw
 //! technical detail carried separately for Advisor Mode display.
 
+use ledger_core::auth::SessionStore;
 use ledger_core::engine::{self, PostCtx};
 use ledger_core::rusqlite::{self, Connection, OptionalExtension};
 use ledger_core::seed::{self, CompanyConfig};
@@ -13,6 +14,27 @@ use std::sync::Mutex;
 use tauri::Manager;
 
 struct Db(Mutex<Connection>);
+
+/// Who's using LedgerOne right now (Spec 07 §5). One process = one signed-in
+/// user; see `ledger_core::auth` for the actual rules — this is IPC plumbing
+/// only, per the project's one architectural law (business logic lives in
+/// ledger-core, the shell just wraps it).
+struct Sess(SessionStore);
+
+/// Every mutating command starts here instead of `PostCtx { user_id: None, .. }`.
+/// Turns the engine's session error into the same owner-language envelope as
+/// everything else, and is the one place "no session ⇒ no post" is enforced.
+fn ctx(sess: &tauri::State<Sess>, confirm_soft_close: bool) -> Result<PostCtx, CmdError> {
+    let session = sess.0.require_session()?;
+    Ok(PostCtx { user_id: Some(session.user_id), confirm_soft_close })
+}
+
+/// Same, but for the Spec 02 role matrix's owner/advisor-only actions (voids,
+/// import-error resolution): staff is rejected HERE, before the engine call.
+fn ctx_not_staff(sess: &tauri::State<Sess>, confirm_soft_close: bool) -> Result<PostCtx, CmdError> {
+    let session = sess.0.require_not_staff()?;
+    Ok(PostCtx { user_id: Some(session.user_id), confirm_soft_close })
+}
 
 /// Client-facing error envelope. `message` is what the owner reads —
 /// plain business language, always with a next step. `detail` is the raw
@@ -64,6 +86,36 @@ impl From<EngineError> for CmdError {
                           every change saves completely or not at all."
                     .into(),
                 detail: Some(err.to_string()),
+            },
+            EngineError::NoActiveSession => CmdError {
+                code: "no_session",
+                message: "Please choose who's using LedgerOne, then try again.".into(),
+                detail: None,
+            },
+            EngineError::StaffForbidden => CmdError {
+                code: "staff_forbidden",
+                message: "Only the owner or the advisor can do that. Ask them, or switch to their login."
+                    .into(),
+                detail: None,
+            },
+            EngineError::AdvisorPinRequired => CmdError {
+                code: "advisor_pin_required",
+                message: "This needs the accountant's area unlocked first — enter the Advisor PIN.".into(),
+                detail: None,
+            },
+            EngineError::AdvisorPinIncorrect { attempts_remaining } => CmdError {
+                code: "advisor_pin_incorrect",
+                message: format!(
+                    "That PIN isn't right. {attempts_remaining} attempt(s) left before it locks for a while."
+                ),
+                detail: None,
+            },
+            EngineError::AdvisorLockedOut { minutes_left } => CmdError {
+                code: "advisor_locked_out",
+                message: format!(
+                    "Too many wrong tries — the accountant's area is locked for about {minutes_left} more minute(s)."
+                ),
+                detail: None,
             },
         }
     }
@@ -186,7 +238,11 @@ pub struct FullSetupDto {
 
 /// The whole Spec 02 wizard, atomically (W1): cancel-anywhere leaves zero rows.
 #[tauri::command]
-fn create_company_full(state: tauri::State<Db>, input: FullSetupDto) -> Result<CompanyDto, CmdError> {
+fn create_company_full(
+    state: tauri::State<Db>,
+    sess: tauri::State<Sess>,
+    input: FullSetupDto,
+) -> Result<CompanyDto, CmdError> {
     let mut conn = state.0.lock().unwrap();
     let name = input.company.name.clone();
     let setup = seed::FullSetup {
@@ -219,7 +275,84 @@ fn create_company_full(state: tauri::State<Db>, input: FullSetupDto) -> Result<C
         eula_version: input.eula_version,
     };
     let id = seed::create_company_full(&mut conn, &setup).map_err(EngineError::from)?;
+    // The wizard just created the owner row (Spec 02 W1) — sign them in immediately
+    // so "establish a session" happens without a second manual step post-setup.
+    let owner_id: String = conn.query_row(
+        "SELECT id FROM users WHERE company_id = ?1 AND role = 'owner'",
+        rusqlite::params![id], |r| r.get(0),
+    ).map_err(db_err)?;
+    sess.0.login(&conn, &owner_id)?;
     Ok(CompanyDto { id, name })
+}
+
+// ===== Session & Advisor Mode (Spec 07 §5) =====
+
+#[derive(Serialize)]
+struct UserDto { id: String, name: String, role: String }
+
+#[tauri::command]
+fn list_users(state: tauri::State<Db>, company_id: String) -> Result<Vec<UserDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT id, name, role FROM users WHERE company_id = ?1 ORDER BY
+           CASE role WHEN 'owner' THEN 0 WHEN 'advisor' THEN 1 ELSE 2 END, name",
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![company_id], |r| {
+        Ok(UserDto { id: r.get(0)?, name: r.get(1)?, role: r.get(2)? })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
+#[derive(Serialize)]
+struct SessionDto { user_id: String, company_id: String, role: String, name: String, advisor_active: bool }
+
+fn session_dto(conn: &Connection, sess: &Sess, session: ledger_core::auth::Session) -> Result<SessionDto, CmdError> {
+    let advisor_active = sess.0.advisor_active(conn)?;
+    Ok(SessionDto {
+        user_id: session.user_id, company_id: session.company_id,
+        role: session.role, name: session.name, advisor_active,
+    })
+}
+
+/// Pick who's using LedgerOne (Spec 07 §5: attribution, never a password gate —
+/// the PIN is reserved for Advisor Mode elevation below).
+#[tauri::command]
+fn login(state: tauri::State<Db>, sess: tauri::State<Sess>, user_id: String) -> Result<SessionDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let session = sess.0.login(&conn, &user_id)?;
+    session_dto(&conn, &sess, session)
+}
+
+#[tauri::command]
+fn logout(sess: tauri::State<Sess>) {
+    sess.0.logout();
+}
+
+/// Called on app start / window focus so the UI can restore or redirect to
+/// the user picker without guessing at in-memory state.
+#[tauri::command]
+fn current_session(state: tauri::State<Db>, sess: tauri::State<Sess>) -> Result<Option<SessionDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    match sess.0.current() {
+        Some(session) => Ok(Some(session_dto(&conn, &sess, session)?)),
+        None => Ok(None),
+    }
+}
+
+/// PIN elevation over the CURRENT session — not a separate login (Spec 07 §5).
+#[tauri::command]
+fn advisor_enter(state: tauri::State<Db>, sess: tauri::State<Sess>, pin: String) -> Result<SessionDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.advisor_enter(&conn, &pin)?;
+    let session = sess.0.current().ok_or(EngineError::NoActiveSession)?;
+    session_dto(&conn, &sess, session)
+}
+
+#[tauri::command]
+fn advisor_exit(state: tauri::State<Db>, sess: tauri::State<Sess>) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.advisor_exit(&conn)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -239,11 +372,13 @@ fn list_companies(state: tauri::State<Db>) -> Result<Vec<CompanyDto>, CmdError> 
 #[tauri::command]
 fn add_bank_account(
     state: tauri::State<Db>,
+    sess: tauri::State<Sess>,
     company_id: String,
     label: String,
     kind: String,
     currency: String,
 ) -> Result<String, CmdError> {
+    sess.0.require_session()?;
     let mut conn = state.0.lock().unwrap();
     seed::add_bank_account(&mut conn, &company_id, &label, &kind, &currency)
         .map_err(|e| EngineError::from(e).into())
@@ -334,6 +469,7 @@ fn dashboard(state: tauri::State<Db>, company_id: String) -> Result<DashboardDto
 #[tauri::command]
 fn record_drawing(
     state: tauri::State<Db>,
+    sess: tauri::State<Sess>,
     company_id: String,
     bank_account_id: String,
     date: String,
@@ -341,9 +477,9 @@ fn record_drawing(
     out: bool,
     confirm_soft_close: bool,
 ) -> Result<String, CmdError> {
+    let post_ctx = ctx(&sess, confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close };
-    engine::post_drawing(&mut conn, &company_id, &bank_account_id, &date, amount_kobo, out, &ctx)
+    engine::post_drawing(&mut conn, &company_id, &bank_account_id, &date, amount_kobo, out, &post_ctx)
         .map_err(Into::into)
 }
 
@@ -368,7 +504,8 @@ fn list_contacts(state: tauri::State<Db>, company_id: String, kind: Option<Strin
 
 /// Inline create from pickers (Spec 07 §6): a real, deduped record — never a free-text string.
 #[tauri::command]
-fn create_contact(state: tauri::State<Db>, company_id: String, name: String, phone: Option<String>, kind: String) -> Result<ContactDto, CmdError> {
+fn create_contact(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, name: String, phone: Option<String>, kind: String) -> Result<ContactDto, CmdError> {
+    sess.0.require_session()?;
     let conn = state.0.lock().unwrap();
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -420,7 +557,8 @@ pub struct NewInvoiceDto {
 struct DraftDto { id: String, number: String }
 
 #[tauri::command]
-fn create_invoice_draft(state: tauri::State<Db>, input: NewInvoiceDto) -> Result<DraftDto, CmdError> {
+fn create_invoice_draft(state: tauri::State<Db>, sess: tauri::State<Sess>, input: NewInvoiceDto) -> Result<DraftDto, CmdError> {
+    let ctx = ctx(&sess, false)?;
     let mut conn = state.0.lock().unwrap();
     let lines: Vec<engine::InvoiceLineInput> = input.lines.into_iter().map(|l| engine::InvoiceLineInput {
         product_id: None,
@@ -431,7 +569,6 @@ fn create_invoice_draft(state: tauri::State<Db>, input: NewInvoiceDto) -> Result
         vat_applied: l.vat_applied,
         income_account_id: None, // free-description lines default to 4000 SALES
     }).collect();
-    let ctx = PostCtx { user_id: None, confirm_soft_close: false };
     let kind = input.kind.as_deref().unwrap_or("invoice");
     let id = engine::create_invoice(
         &mut conn, &input.company_id, &input.contact_id, kind,
@@ -444,9 +581,9 @@ fn create_invoice_draft(state: tauri::State<Db>, input: NewInvoiceDto) -> Result
 }
 
 #[tauri::command]
-fn send_invoice(state: tauri::State<Db>, invoice_id: String, confirm_soft_close: bool) -> Result<(), CmdError> {
+fn send_invoice(state: tauri::State<Db>, sess: tauri::State<Sess>, invoice_id: String, confirm_soft_close: bool) -> Result<(), CmdError> {
+    let ctx = ctx(&sess, confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close };
     engine::post_invoice(&mut conn, &invoice_id, &ctx)?;
     Ok(())
 }
@@ -521,12 +658,12 @@ pub struct PaymentInDto {
 struct PaymentDoneDto { receipt_number: Option<String>, deposit_kobo: i64, wht_kobo: i64 }
 
 #[tauri::command]
-fn record_payment_in(state: tauri::State<Db>, input: PaymentInDto) -> Result<PaymentDoneDto, CmdError> {
+fn record_payment_in(state: tauri::State<Db>, sess: tauri::State<Sess>, input: PaymentInDto) -> Result<PaymentDoneDto, CmdError> {
+    let ctx = ctx(&sess, input.confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
     let allocs: Vec<engine::Allocation> = input.allocations.into_iter()
         .map(|a| engine::Allocation { target_id: a.invoice_id, amount_kobo: a.amount_kobo })
         .collect();
-    let ctx = PostCtx { user_id: None, confirm_soft_close: input.confirm_soft_close };
     let res = engine::post_payment_in(
         &mut conn, &input.company_id, &input.contact_id, &input.bank_account_id,
         &input.payment_date, input.amount_kobo, input.wht_kobo, &allocs, None, &ctx,
@@ -603,9 +740,9 @@ pub struct ExpenseDto {
 }
 
 #[tauri::command]
-fn record_expense(state: tauri::State<Db>, input: ExpenseDto) -> Result<String, CmdError> {
+fn record_expense(state: tauri::State<Db>, sess: tauri::State<Sess>, input: ExpenseDto) -> Result<String, CmdError> {
+    let ctx = ctx(&sess, input.confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close: input.confirm_soft_close };
     engine::post_expense(
         &mut conn, &input.company_id, &input.bank_account_id, &input.payee,
         &input.expense_account_id, &input.date, input.gross_kobo,
@@ -637,9 +774,9 @@ pub struct NewBillDto {
 
 /// Save-as-open: creates the bill AND posts it (Dr expense / Dr VAT input / Cr AP).
 #[tauri::command]
-fn create_bill(state: tauri::State<Db>, input: NewBillDto) -> Result<String, CmdError> {
+fn create_bill(state: tauri::State<Db>, sess: tauri::State<Sess>, input: NewBillDto) -> Result<String, CmdError> {
+    let ctx = ctx(&sess, input.confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close: input.confirm_soft_close };
     let lines: Vec<engine::BillLineInput> = input.lines.into_iter().map(|l| engine::BillLineInput {
         product_id: None,
         description: l.description,
@@ -722,7 +859,8 @@ pub struct PaymentOutDto {
 }
 
 #[tauri::command]
-fn record_payment_out(state: tauri::State<Db>, input: PaymentOutDto) -> Result<PaymentDoneDto, CmdError> {
+fn record_payment_out(state: tauri::State<Db>, sess: tauri::State<Sess>, input: PaymentOutDto) -> Result<PaymentDoneDto, CmdError> {
+    let ctx = ctx(&sess, input.confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
     let allocs: Vec<engine::Allocation> = input.allocations.into_iter()
         .map(|a| engine::Allocation { target_id: a.invoice_id, amount_kobo: a.amount_kobo })
@@ -732,7 +870,6 @@ fn record_payment_out(state: tauri::State<Db>, input: PaymentOutDto) -> Result<P
         "manual" => engine::WhtMode::Manual(input.wht_manual_kobo.unwrap_or(0)),
         _ => engine::WhtMode::Auto,
     };
-    let ctx = PostCtx { user_id: None, confirm_soft_close: input.confirm_soft_close };
     let res = engine::post_payment_out(
         &mut conn, &input.company_id, &input.contact_id, &input.bank_account_id,
         &input.payment_date, &allocs, mode, &ctx,
@@ -752,9 +889,9 @@ pub struct TransferDto {
 }
 
 #[tauri::command]
-fn record_transfer(state: tauri::State<Db>, input: TransferDto) -> Result<String, CmdError> {
+fn record_transfer(state: tauri::State<Db>, sess: tauri::State<Sess>, input: TransferDto) -> Result<String, CmdError> {
+    let ctx = ctx(&sess, input.confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close: input.confirm_soft_close };
     engine::post_transfer(
         &mut conn, &input.company_id, &input.from_bank_id, &input.to_bank_id,
         &input.date, input.amount_kobo, input.fee_kobo, &ctx,
@@ -764,9 +901,11 @@ fn record_transfer(state: tauri::State<Db>, input: TransferDto) -> Result<String
 // ===== Voids, quotes, documents (Spec 03 completion) =====
 
 #[tauri::command]
-fn void_invoice_cmd(state: tauri::State<Db>, invoice_id: String, confirm_soft_close: bool) -> Result<(), CmdError> {
+fn void_invoice_cmd(state: tauri::State<Db>, sess: tauri::State<Sess>, invoice_id: String, confirm_soft_close: bool) -> Result<(), CmdError> {
+    // Spec 02 role matrix: voiding documents is owner/advisor only — staff is
+    // blocked HERE, at the command layer, not by hiding the Cancel link.
+    let ctx = ctx_not_staff(&sess, confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close };
     let today = ledger_core::ids::now_iso()[..10].to_string();
     engine::void_invoice(&mut conn, &invoice_id, &today, &ctx)?;
     Ok(())
@@ -801,18 +940,19 @@ fn list_payments(state: tauri::State<Db>, company_id: String) -> Result<Vec<Paym
 }
 
 #[tauri::command]
-fn void_payment_cmd(state: tauri::State<Db>, payment_id: String, confirm_soft_close: bool) -> Result<(), CmdError> {
+fn void_payment_cmd(state: tauri::State<Db>, sess: tauri::State<Sess>, payment_id: String, confirm_soft_close: bool) -> Result<(), CmdError> {
+    // Same restriction as void_invoice_cmd — owner/advisor only (Spec 02 role matrix).
+    let ctx = ctx_not_staff(&sess, confirm_soft_close)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close };
     let today = ledger_core::ids::now_iso()[..10].to_string();
     engine::void_payment(&mut conn, &payment_id, &today, &ctx)?;
     Ok(())
 }
 
 #[tauri::command]
-fn convert_quote_cmd(state: tauri::State<Db>, quote_id: String) -> Result<DraftDto, CmdError> {
+fn convert_quote_cmd(state: tauri::State<Db>, sess: tauri::State<Sess>, quote_id: String) -> Result<DraftDto, CmdError> {
+    let ctx = ctx(&sess, false)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx { user_id: None, confirm_soft_close: false };
     let id = engine::convert_quote(&mut conn, &quote_id, &ctx)?;
     let number: String = conn.query_row(
         "SELECT number FROM invoices WHERE id = ?1", rusqlite::params![id], |r| r.get(0),
@@ -883,7 +1023,8 @@ fn invoice_doc(state: tauri::State<Db>, invoice_id: String) -> Result<InvoiceDoc
 
 /// Delivery log (Spec 03 §7 / document_deliveries) — the register's "sent via WhatsApp".
 #[tauri::command]
-fn log_delivery(state: tauri::State<Db>, company_id: String, doc_type: String, doc_id: String, channel: String, recipient: Option<String>) -> Result<(), CmdError> {
+fn log_delivery(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, doc_type: String, doc_id: String, channel: String, recipient: Option<String>) -> Result<(), CmdError> {
+    sess.0.require_session()?;
     let conn = state.0.lock().unwrap();
     conn.execute(
         "INSERT INTO document_deliveries (id, company_id, doc_type, doc_id, channel, recipient, created_at)
@@ -913,8 +1054,9 @@ fn recon_open(state: tauri::State<Db>, bank_account_id: String) -> Result<Option
 }
 
 #[tauri::command]
-fn recon_start(state: tauri::State<Db>, company_id: String, bank_account_id: String,
+fn recon_start(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, bank_account_id: String,
                statement_date: String, statement_balance_kobo: i64) -> Result<String, CmdError> {
+    sess.0.require_session()?;
     let mut conn = state.0.lock().unwrap();
     recon::start_reconciliation(&mut conn, &company_id, &bank_account_id, &statement_date, statement_balance_kobo)
         .map_err(Into::into)
@@ -936,9 +1078,10 @@ pub struct MappingDto {
 struct ImportResultDto { imported: usize, skipped: usize, errors: Vec<String> }
 
 #[tauri::command]
-fn recon_import_csv(state: tauri::State<Db>, recon_id: String, csv_text: String, mapping: MappingDto)
+fn recon_import_csv(state: tauri::State<Db>, sess: tauri::State<Sess>, recon_id: String, csv_text: String, mapping: MappingDto)
     -> Result<ImportResultDto, CmdError>
 {
+    sess.0.require_session()?;
     let mut conn = state.0.lock().unwrap();
     let map = recon::CsvMapping {
         header_rows: mapping.header_rows, date_col: mapping.date_col, desc_col: mapping.desc_col,
@@ -1022,39 +1165,53 @@ fn recon_candidates(state: tauri::State<Db>, recon_id: String, line_id: String) 
 }
 
 #[tauri::command]
-fn recon_match(state: tauri::State<Db>, line_id: String, journal_line_ids: Vec<String>) -> Result<(), CmdError> {
+fn recon_match(state: tauri::State<Db>, sess: tauri::State<Sess>, line_id: String, journal_line_ids: Vec<String>) -> Result<(), CmdError> {
+    sess.0.require_session()?;
     let mut conn = state.0.lock().unwrap();
     recon::manual_match(&mut conn, &line_id, &journal_line_ids, "manual").map_err(Into::into)
 }
 
 #[tauri::command]
-fn recon_unmatch(state: tauri::State<Db>, line_id: String) -> Result<(), CmdError> {
+fn recon_unmatch(state: tauri::State<Db>, sess: tauri::State<Sess>, line_id: String) -> Result<(), CmdError> {
+    sess.0.require_session()?;
     let mut conn = state.0.lock().unwrap();
     recon::unmatch(&mut conn, &line_id).map_err(Into::into)
 }
 
+/// Spec 04 §7.5: flagging "needs review" is deliberately open to ANY role —
+/// it's the accounts officer's mechanism for "I'm not sure, Oga will know."
+/// Session is still required so the note is attributable.
 #[tauri::command]
-fn recon_flag(state: tauri::State<Db>, line_id: String, note: String) -> Result<(), CmdError> {
+fn recon_flag(state: tauri::State<Db>, sess: tauri::State<Sess>, line_id: String, note: String) -> Result<(), CmdError> {
+    let session = sess.0.require_session()?;
     let conn = state.0.lock().unwrap();
-    recon::flag_needs_review(&conn, &line_id, &note, None).map_err(Into::into)
+    recon::flag_needs_review(&conn, &line_id, &note, Some(&session.user_id)).map_err(Into::into)
 }
 
+/// Spec 04 §7.5: write-off is owner/advisor only, staff never — blocked here,
+/// before the engine call. (The engine itself separately refuses anything
+/// above the company's write-off limit outright, for any role — an
+/// Advisor-Mode-elevated bypass of that limit is a known follow-up, not yet
+/// wired; see PROGRESS.md.)
 #[tauri::command]
-fn recon_writeoff(state: tauri::State<Db>, line_id: String, note: String) -> Result<(), CmdError> {
+fn recon_writeoff(state: tauri::State<Db>, sess: tauri::State<Sess>, line_id: String, note: String) -> Result<(), CmdError> {
+    let ctx = ctx_not_staff(&sess, false)?;
     let mut conn = state.0.lock().unwrap();
-    let ctx = PostCtx::default();
     recon::write_off(&mut conn, &line_id, &note, &ctx)?;
     Ok(())
 }
 
+/// Spec 04 §7.5 path 4: marking a line as import garbage is advisor/owner only.
 #[tauri::command]
-fn recon_import_error(state: tauri::State<Db>, line_id: String) -> Result<(), CmdError> {
+fn recon_import_error(state: tauri::State<Db>, sess: tauri::State<Sess>, line_id: String) -> Result<(), CmdError> {
+    let ctx = ctx_not_staff(&sess, false)?;
     let conn = state.0.lock().unwrap();
-    recon::mark_import_error(&conn, &line_id, &PostCtx::default()).map_err(Into::into)
+    recon::mark_import_error(&conn, &line_id, &ctx).map_err(Into::into)
 }
 
 #[tauri::command]
-fn recon_complete(state: tauri::State<Db>, recon_id: String) -> Result<String, CmdError> {
+fn recon_complete(state: tauri::State<Db>, sess: tauri::State<Sess>, recon_id: String) -> Result<String, CmdError> {
+    sess.0.require_session()?;
     let mut conn = state.0.lock().unwrap();
     recon::complete(&mut conn, &recon_id).map_err(Into::into)
 }
@@ -1068,12 +1225,19 @@ pub fn run() {
             let db_path = dir.join("ledgerone.db");
             let conn = ledger_core::open(db_path.to_str().expect("utf8 path"))?;
             app.manage(Db(Mutex::new(conn)));
+            app.manage(Sess(SessionStore::new()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             create_company,
             create_company_full,
             list_companies,
+            list_users,
+            login,
+            logout,
+            current_session,
+            advisor_enter,
+            advisor_exit,
             add_bank_account,
             dashboard,
             record_drawing,

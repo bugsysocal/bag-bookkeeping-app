@@ -22,6 +22,19 @@ pub enum EngineError {
     /// P7, in owner language upstream.
     #[error("insufficient stock: short {short_milli} milliunits")]
     InsufficientStock { short_milli: i64 },
+    /// No user has been selected for this session — every posting call must be attributable.
+    #[error("no active session")]
+    NoActiveSession,
+    /// Spec 02 role matrix: this action is owner/advisor only; the session's role is `staff`.
+    #[error("action restricted to owner/advisor roles")]
+    StaffForbidden,
+    /// Spec 07 §5: the action needs Advisor Mode active (PIN elevation), not merely the right role.
+    #[error("advisor mode is not currently active")]
+    AdvisorPinRequired,
+    #[error("incorrect advisor PIN, {attempts_remaining} attempt(s) remaining")]
+    AdvisorPinIncorrect { attempts_remaining: u32 },
+    #[error("advisor mode locked, {minutes_left} minute(s) remaining")]
+    AdvisorLockedOut { minutes_left: u64 },
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
 }
