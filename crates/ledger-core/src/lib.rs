@@ -11,6 +11,7 @@ pub mod auth;
 pub mod db;
 pub mod engine;
 pub mod recon;
+pub mod reports;
 pub mod ids;
 pub mod money;
 pub mod posting;

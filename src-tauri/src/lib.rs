@@ -1216,6 +1216,281 @@ fn recon_complete(state: tauri::State<Db>, sess: tauri::State<Sess>, recon_id: S
     recon::complete(&mut conn, &recon_id).map_err(Into::into)
 }
 
+// ===== Statements & Reports (Spec 05) =====
+// Every command here is read-only — no PostCtx, no posting. §7's "no schema,
+// no engine surface" carries through to the shell: these are thin wrappers
+// over ledger_core::reports, nothing more.
+
+use ledger_core::reports;
+
+#[derive(Serialize)]
+struct PeriodDto { start: String, end: String }
+impl From<reports::PeriodRange> for PeriodDto {
+    fn from(p: reports::PeriodRange) -> Self { PeriodDto { start: p.start, end: p.end } }
+}
+
+/// Pre-computed fiscal-aware ranges for the report picker (Spec 05 R2) — all
+/// date math happens once, here, in Rust; the UI just offers these as options.
+#[derive(Serialize)]
+struct ReportPeriodsDto { this_month: PeriodDto, this_quarter: PeriodDto, ytd: PeriodDto, calendar_month: PeriodDto }
+
+#[tauri::command]
+fn report_periods(state: tauri::State<Db>, company_id: String) -> Result<ReportPeriodsDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let fsm: i64 = conn.query_row(
+        "SELECT fiscal_year_start_month FROM companies WHERE id = ?1", rusqlite::params![company_id], |r| r.get(0),
+    ).map_err(db_err)?;
+    let today = ledger_core::ids::now_iso()[..10].to_string();
+    let (y, m): (i64, u32) = (today[..4].parse().unwrap(), today[5..7].parse().unwrap());
+    Ok(ReportPeriodsDto {
+        this_month: reports::calendar_month_range(y, m).into(),
+        this_quarter: reports::fiscal_quarter_range(fsm as u32, &today).into(),
+        ytd: reports::ytd_range(fsm as u32, &today).into(),
+        calendar_month: reports::calendar_month_range(y, m).into(),
+    })
+}
+
+#[derive(Serialize)]
+struct AgingBucketsDto { current_kobo: i64, d1_30_kobo: i64, d31_60_kobo: i64, d61_90_kobo: i64, d90_plus_kobo: i64 }
+#[derive(Serialize)]
+struct AgingRowDto { contact_id: String, contact_name: String, buckets: AgingBucketsDto, deposit_kobo: i64 }
+impl From<reports::AgingRow> for AgingRowDto {
+    fn from(r: reports::AgingRow) -> Self {
+        AgingRowDto {
+            contact_id: r.contact_id, contact_name: r.contact_name, deposit_kobo: r.deposit_kobo,
+            buckets: AgingBucketsDto {
+                current_kobo: r.buckets.current_kobo, d1_30_kobo: r.buckets.d1_30_kobo,
+                d31_60_kobo: r.buckets.d31_60_kobo, d61_90_kobo: r.buckets.d61_90_kobo,
+                d90_plus_kobo: r.buckets.d90_plus_kobo,
+            },
+        }
+    }
+}
+
+#[tauri::command]
+fn aging_receivables(state: tauri::State<Db>, company_id: String, as_of: String) -> Result<Vec<AgingRowDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    Ok(reports::aging_receivables(&conn, &company_id, &as_of)?.into_iter().map(Into::into).collect())
+}
+#[tauri::command]
+fn aging_payables(state: tauri::State<Db>, company_id: String, as_of: String) -> Result<Vec<AgingRowDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    Ok(reports::aging_payables(&conn, &company_id, &as_of)?.into_iter().map(Into::into).collect())
+}
+
+#[derive(Serialize)]
+struct SalesRowDto { label: String, qty_milli: i64, value_kobo: i64 }
+impl From<reports::SalesRow> for SalesRowDto {
+    fn from(r: reports::SalesRow) -> Self { SalesRowDto { label: r.label, qty_milli: r.qty_milli, value_kobo: r.value_kobo } }
+}
+#[tauri::command]
+fn sales_by_customer(state: tauri::State<Db>, company_id: String, start: String, end: String, top_n: usize) -> Result<Vec<SalesRowDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    Ok(reports::sales_by_customer(&conn, &company_id, &start, &end, top_n)?.into_iter().map(Into::into).collect())
+}
+#[tauri::command]
+fn sales_by_product(state: tauri::State<Db>, company_id: String, start: String, end: String, top_n: usize) -> Result<Vec<SalesRowDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    Ok(reports::sales_by_product(&conn, &company_id, &start, &end, top_n)?.into_iter().map(Into::into).collect())
+}
+#[tauri::command]
+fn drawings_in_range(state: tauri::State<Db>, company_id: String, start: String, end: String) -> Result<i64, CmdError> {
+    let conn = state.0.lock().unwrap();
+    Ok(reports::drawings_in_range(&conn, &company_id, &start, &end)?)
+}
+
+#[derive(Serialize)]
+struct AccountAmountDto { account_id: String, code: String, name: String, amount_kobo: i64 }
+impl From<reports::AccountAmount> for AccountAmountDto {
+    fn from(a: reports::AccountAmount) -> Self { AccountAmountDto { account_id: a.account_id, code: a.code, name: a.name, amount_kobo: a.amount_kobo } }
+}
+#[derive(Serialize)]
+struct IncomeStatementDto {
+    revenue: Vec<AccountAmountDto>, revenue_total_kobo: i64,
+    cogs: Vec<AccountAmountDto>, cogs_total_kobo: i64,
+    gross_profit_kobo: i64, gross_margin_bp: i64,
+    opex: Vec<AccountAmountDto>, opex_total_kobo: i64,
+    operating_profit_kobo: i64, non_operating_kobo: i64, net_profit_kobo: i64,
+}
+#[tauri::command]
+fn income_statement_accrual(state: tauri::State<Db>, company_id: String, start: String, end: String) -> Result<IncomeStatementDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let s = reports::income_statement_accrual(&conn, &company_id, &start, &end)?;
+    Ok(IncomeStatementDto {
+        revenue: s.revenue.into_iter().map(Into::into).collect(), revenue_total_kobo: s.revenue_total_kobo,
+        cogs: s.cogs.into_iter().map(Into::into).collect(), cogs_total_kobo: s.cogs_total_kobo,
+        gross_profit_kobo: s.gross_profit_kobo, gross_margin_bp: s.gross_margin_bp,
+        opex: s.opex.into_iter().map(Into::into).collect(), opex_total_kobo: s.opex_total_kobo,
+        operating_profit_kobo: s.operating_profit_kobo, non_operating_kobo: s.non_operating_kobo,
+        net_profit_kobo: s.net_profit_kobo,
+    })
+}
+
+#[derive(Serialize)]
+struct CashBasisDto { revenue_kobo: i64, expense_kobo: i64, net_profit_kobo: i64, caption: String }
+#[tauri::command]
+fn income_statement_cash_basis(state: tauri::State<Db>, company_id: String, start: String, end: String) -> Result<CashBasisDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let s = reports::income_statement_cash_basis(&conn, &company_id, &start, &end)?;
+    Ok(CashBasisDto { revenue_kobo: s.revenue_kobo, expense_kobo: s.expense_kobo, net_profit_kobo: s.net_profit_kobo, caption: s.caption })
+}
+
+#[derive(Serialize)]
+struct BalanceSheetDto {
+    cash_and_bank_kobo: i64, receivables_kobo: i64, inventory_kobo: i64, fixed_assets_net_kobo: i64,
+    other_assets_kobo: i64, total_assets_kobo: i64,
+    current_liabilities_kobo: i64, loans_kobo: i64, other_liabilities_kobo: i64, total_liabilities_kobo: i64,
+    opening_balance_equity_kobo: i64, owner_capital_kobo: i64, drawings_kobo: i64,
+    retained_earnings_kobo: i64, current_year_earnings_kobo: i64, total_equity_kobo: i64, ties: bool,
+}
+#[tauri::command]
+fn balance_sheet(state: tauri::State<Db>, company_id: String, as_of: String) -> Result<BalanceSheetDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let b = reports::balance_sheet(&conn, &company_id, &as_of)?;
+    Ok(BalanceSheetDto {
+        cash_and_bank_kobo: b.cash_and_bank_kobo, receivables_kobo: b.receivables_kobo, inventory_kobo: b.inventory_kobo,
+        fixed_assets_net_kobo: b.fixed_assets_net_kobo, other_assets_kobo: b.other_assets_kobo, total_assets_kobo: b.total_assets_kobo,
+        current_liabilities_kobo: b.current_liabilities_kobo, loans_kobo: b.loans_kobo,
+        other_liabilities_kobo: b.other_liabilities_kobo, total_liabilities_kobo: b.total_liabilities_kobo,
+        opening_balance_equity_kobo: b.opening_balance_equity_kobo, owner_capital_kobo: b.owner_capital_kobo,
+        drawings_kobo: b.drawings_kobo, retained_earnings_kobo: b.retained_earnings_kobo,
+        current_year_earnings_kobo: b.current_year_earnings_kobo, total_equity_kobo: b.total_equity_kobo, ties: b.ties,
+    })
+}
+
+#[derive(Serialize)]
+struct CashFlowDto { operating_kobo: i64, investing_kobo: i64, financing_kobo: i64, net_change_kobo: i64, opening_cash_kobo: i64, closing_cash_kobo: i64, ties: bool }
+#[tauri::command]
+fn cash_flow_statement(state: tauri::State<Db>, company_id: String, start: String, end: String) -> Result<CashFlowDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let c = reports::cash_flow_statement(&conn, &company_id, &start, &end)?;
+    Ok(CashFlowDto {
+        operating_kobo: c.operating_kobo, investing_kobo: c.investing_kobo, financing_kobo: c.financing_kobo,
+        net_change_kobo: c.net_change_kobo, opening_cash_kobo: c.opening_cash_kobo, closing_cash_kobo: c.closing_cash_kobo, ties: c.ties,
+    })
+}
+
+// --- Advisor Mode only: Trial Balance & General Ledger (Spec 05 §4.5 / Spec 07 §5) ---
+// The first real UI consumer of require_advisor_elevated (PROGRESS.md flagged
+// this as waiting for one) — a session must have entered Advisor Mode, not
+// merely hold the owner/advisor role, to see these.
+
+#[derive(Serialize)]
+struct TrialBalanceRowDto { account_id: String, code: String, name: String, class: String, debit_kobo: i64, credit_kobo: i64 }
+#[tauri::command]
+fn trial_balance(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, as_of: String) -> Result<Vec<TrialBalanceRowDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    Ok(reports::trial_balance(&conn, &company_id, &as_of)?.into_iter().map(|r| TrialBalanceRowDto {
+        account_id: r.account_id, code: r.code, name: r.name, class: r.class, debit_kobo: r.debit_kobo, credit_kobo: r.credit_kobo,
+    }).collect())
+}
+
+#[derive(Serialize)]
+struct GlLineDto { entry_id: String, date: String, memo: String, amount_kobo: i64, running_balance_kobo: i64, contact_name: Option<String> }
+#[derive(Serialize)]
+struct GeneralLedgerDto { opening_balance_kobo: i64, lines: Vec<GlLineDto>, closing_balance_kobo: i64 }
+#[tauri::command]
+fn general_ledger(state: tauri::State<Db>, sess: tauri::State<Sess>, account_id: String, company_id: String, start: String, end: String, contact_id: Option<String>) -> Result<GeneralLedgerDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    let g = reports::general_ledger(&conn, &company_id, &account_id, &start, &end, contact_id.as_deref())?;
+    Ok(GeneralLedgerDto {
+        opening_balance_kobo: g.opening_balance_kobo, closing_balance_kobo: g.closing_balance_kobo,
+        lines: g.lines.into_iter().map(|l| GlLineDto {
+            entry_id: l.entry_id, date: l.date, memo: l.memo, amount_kobo: l.amount_kobo,
+            running_balance_kobo: l.running_balance_kobo, contact_name: l.contact_name,
+        }).collect(),
+    })
+}
+
+/// Chart of accounts picker for the GL screen (Advisor Mode) — trivial read, no gating needed
+/// beyond what the GL query itself enforces.
+#[derive(Serialize)]
+struct AccountDto { id: String, code: String, name: String, class: String }
+#[tauri::command]
+fn list_accounts(state: tauri::State<Db>, company_id: String) -> Result<Vec<AccountDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT id, code, name, class FROM accounts WHERE company_id = ?1 AND is_active = 1 ORDER BY code",
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![company_id], |r| {
+        Ok(AccountDto { id: r.get(0)?, code: r.get(1)?, name: r.get(2)?, class: r.get(3)? })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
+// --- Tax reports (Spec 05 §5) ---
+
+#[derive(Serialize)]
+struct VatLineDto { doc_number: String, party_name: String, tin: Option<String>, net_kobo: i64, vat_kobo: i64 }
+#[derive(Serialize)]
+struct VatReportDto {
+    output: Vec<VatLineDto>, output_vat_kobo: i64,
+    input: Vec<VatLineDto>, input_vat_kobo: i64,
+    net_payable_kobo: i64, credit_brought_forward_kobo: i64, net_due_kobo: i64,
+}
+#[tauri::command]
+fn vat_report(state: tauri::State<Db>, company_id: String, month_start: String, month_end: String) -> Result<VatReportDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let range = reports::PeriodRange { start: month_start, end: month_end };
+    let v = reports::vat_report(&conn, &company_id, &range)?;
+    let cvt = |l: reports::VatLine| VatLineDto { doc_number: l.doc_number, party_name: l.party_name, tin: l.tin, net_kobo: l.net_kobo, vat_kobo: l.vat_kobo };
+    Ok(VatReportDto {
+        output: v.output.into_iter().map(cvt).collect(), output_vat_kobo: v.output_vat_kobo,
+        input: v.input.into_iter().map(cvt).collect(), input_vat_kobo: v.input_vat_kobo,
+        net_payable_kobo: v.net_payable_kobo, credit_brought_forward_kobo: v.credit_brought_forward_kobo, net_due_kobo: v.net_due_kobo,
+    })
+}
+
+#[derive(Serialize)]
+struct WhtRemittanceLineDto { payment_date: String, supplier_name: String, tin: Option<String>, bill_ref: Option<String>, base_kobo: i64, wht_kobo: i64 }
+#[tauri::command]
+fn wht_remittance_schedule(state: tauri::State<Db>, company_id: String, start: String, end: String) -> Result<Vec<WhtRemittanceLineDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let range = reports::PeriodRange { start, end };
+    Ok(reports::wht_remittance_schedule(&conn, &company_id, &range)?.into_iter().map(|l| WhtRemittanceLineDto {
+        payment_date: l.payment_date, supplier_name: l.supplier_name, tin: l.tin, bill_ref: l.bill_ref, base_kobo: l.base_kobo, wht_kobo: l.wht_kobo,
+    }).collect())
+}
+
+#[derive(Serialize)]
+struct WhtCreditLineDto { receipt_date: String, customer_name: String, tin: Option<String>, base_kobo: i64, wht_kobo: i64 }
+#[tauri::command]
+fn wht_credit_schedule(state: tauri::State<Db>, company_id: String, start: String, end: String) -> Result<Vec<WhtCreditLineDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let range = reports::PeriodRange { start, end };
+    Ok(reports::wht_credit_schedule(&conn, &company_id, &range)?.into_iter().map(|l| WhtCreditLineDto {
+        receipt_date: l.receipt_date, customer_name: l.customer_name, tin: l.tin, base_kobo: l.base_kobo, wht_kobo: l.wht_kobo,
+    }).collect())
+}
+
+#[tauri::command]
+fn wht_cumulative_credit(state: tauri::State<Db>, company_id: String, as_of: String) -> Result<i64, CmdError> {
+    let conn = state.0.lock().unwrap();
+    Ok(reports::wht_cumulative_credit(&conn, &company_id, &as_of)?)
+}
+
+// --- Contact statement of account (Spec 05 §6) ---
+
+#[derive(Serialize)]
+struct StatementLineDto { date: String, description: String, debit_kobo: i64, credit_kobo: i64, running_balance_kobo: i64 }
+#[derive(Serialize)]
+struct ContactStatementDto { contact_name: String, opening_balance_kobo: i64, lines: Vec<StatementLineDto>, closing_balance_kobo: i64, deposit_kobo: i64 }
+#[tauri::command]
+fn contact_statement(state: tauri::State<Db>, company_id: String, contact_id: String, start: String, end: String) -> Result<ContactStatementDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let s = reports::contact_statement(&conn, &company_id, &contact_id, &start, &end)?;
+    let deposit_kobo = reports::contact_deposit_balance(&conn, &company_id, &contact_id)?;
+    Ok(ContactStatementDto {
+        contact_name: s.contact_name, opening_balance_kobo: s.opening_balance_kobo, closing_balance_kobo: s.closing_balance_kobo,
+        deposit_kobo,
+        lines: s.lines.into_iter().map(|l| StatementLineDto {
+            date: l.date, description: l.description, debit_kobo: l.debit_kobo, credit_kobo: l.credit_kobo, running_balance_kobo: l.running_balance_kobo,
+        }).collect(),
+    })
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1273,7 +1548,25 @@ pub fn run() {
             recon_flag,
             recon_writeoff,
             recon_import_error,
-            recon_complete
+            recon_complete,
+            report_periods,
+            aging_receivables,
+            aging_payables,
+            sales_by_customer,
+            sales_by_product,
+            drawings_in_range,
+            income_statement_accrual,
+            income_statement_cash_basis,
+            balance_sheet,
+            cash_flow_statement,
+            trial_balance,
+            general_ledger,
+            list_accounts,
+            vat_report,
+            wht_remittance_schedule,
+            wht_credit_schedule,
+            wht_cumulative_credit,
+            contact_statement
         ])
         .run(tauri::generate_context!())
         .expect("error while running LedgerOne");

@@ -36,6 +36,13 @@
   .userpick { display:flex; flex-direction:column; gap:8px; margin-top:14px; }
   .userpick button { text-align:left; padding:14px 18px; }
   .userpick .role { font-weight:400; opacity:.8; font-size:12px; }
+  .subtabs { display:flex; gap:6px; margin-bottom:16px; flex-wrap:wrap; }
+  .subtabs a { padding:6px 14px; border-radius:99px; font-size:13px; font-weight:600; color:var(--mut); cursor:pointer; background:#f1f5f9; }
+  .subtabs a.active { background:var(--green); color:#fff; }
+  .stmttotal td { border-top:2px solid var(--ink); font-weight:700; }
+  .stmtsection td:first-child { font-weight:700; padding-top:14px; }
+  .indent td:first-child { padding-left:18px; }
+  .tie-ok { color:#166534; } .tie-bad { color:#991b1b; font-weight:700; }
   @media print { /* the document view prints clean; system dialog's PDF printer = Save as PDF (Spec 03 §7) */
     header, .toolbar, .no-print, #toast, #err { display:none !important; }
     body { background:#fff; } main { margin:0; max-width:none; }
@@ -384,6 +391,7 @@ function chrome(active, body){
       <a class="navlink" id="n-pur">Purchases</a>
       <a class="navlink" id="n-bank">Bank &amp; Cash</a>
       <a class="navlink" id="n-pays">Payments</a>
+      <a class="navlink" id="n-reports">Reports</a>
       <span class="spacer"></span>
       <button id="a-newinv">New Invoice</button>
       <button class="ghost" id="a-exp">Record Expense</button>
@@ -391,7 +399,7 @@ function chrome(active, body){
     </div>${body}<div id="err"></div>`;
   el("n-home").onclick = viewDashboard; el("n-inv").onclick = viewInvoices;
   el("n-pur").onclick = viewPurchases; el("n-bank").onclick = viewBank;
-  el("n-pays").onclick = viewPayments;
+  el("n-pays").onclick = viewPayments; el("n-reports").onclick = () => viewReports();
   el("a-newinv").onclick = () => viewNewInvoice(false);
   el("a-exp").onclick = viewRecordExpense;
   el("a-pay").onclick = () => viewRecordPayment();
@@ -1101,6 +1109,240 @@ async function viewPayments(){
     try { await invoke("void_payment_cmd",{paymentId:a.dataset.vp, confirmSoftClose:false});
       toast("Payment cancelled."); viewPayments(); } catch(e){ err(e); }
   });
+}
+
+// ════════ Reports (Spec 05) ════════
+// Every report here is a live query — nothing on these screens is ever
+// editable, and nothing is stored beyond what the ledger already holds (R1).
+
+let REPORT_TAB = "owner"; // owner | statements | tax | advisor
+let REPORT_PERIODS = null;
+let STMT_PERIOD = "this_month";
+let STMT_CASH = false;
+let TAX_YM = null;
+
+async function viewReports(){
+  REPORT_PERIODS = await invoke("report_periods",{companyId:CO.id});
+  renderReportTabs();
+}
+
+function renderReportTabs(){
+  const tabs = [["owner","Owner"],["statements","Statements"],["tax","Tax"],["advisor","Advisor"]];
+  const nav = `<div class="subtabs">${tabs.map(([k,l])=>
+    `<a class="${REPORT_TAB===k?"active":""}" data-tab="${k}">${l}</a>`).join("")}</div>`;
+  chrome("reports", `<div class="card">${nav}<div id="reportbody"></div></div>`);
+  document.querySelectorAll("[data-tab]").forEach(a => a.onclick = () => { REPORT_TAB = a.dataset.tab; renderReportTabs(); });
+  ({ owner: renderOwnerReports, statements: renderStatements, tax: renderTaxReports, advisor: renderAdvisorReports })[REPORT_TAB]();
+}
+
+// ── Owner tier: aging, sales by customer/product, drawings note (§3) ──
+async function renderOwnerReports(){
+  const box = el("reportbody");
+  box.innerHTML = `<div class="mut">Loading…</div>`;
+  const p = REPORT_PERIODS.this_month;
+  const [ar, ap, salesC, salesP, drawings] = await Promise.all([
+    invoke("aging_receivables",{companyId:CO.id, asOf:today()}),
+    invoke("aging_payables",{companyId:CO.id, asOf:today()}),
+    invoke("sales_by_customer",{companyId:CO.id, start:p.start, end:p.end, topN:5}),
+    invoke("sales_by_product",{companyId:CO.id, start:p.start, end:p.end, topN:5}),
+    invoke("drawings_in_range",{companyId:CO.id, start:p.start, end:p.end}),
+  ]);
+  const bucketTotal = b => b.current_kobo + b.d1_30_kobo + b.d31_60_kobo + b.d61_90_kobo + b.d90_plus_kobo;
+  const agingTable = (rows, who) => rows.length ? `<table>
+      <tr><th>${who}</th><th>Current</th><th>1-30</th><th>31-60</th><th>61-90</th><th>90+</th><th>Total</th><th>Paid ahead</th></tr>
+      ${rows.map(r=>`<tr><td>${esc(r.contact_name)}</td><td>${naira(r.buckets.current_kobo)}</td><td>${naira(r.buckets.d1_30_kobo)}</td>
+        <td>${naira(r.buckets.d31_60_kobo)}</td><td>${naira(r.buckets.d61_90_kobo)}</td><td>${naira(r.buckets.d90_plus_kobo)}</td>
+        <td><b>${naira(bucketTotal(r.buckets))}</b></td><td>${r.deposit_kobo>0?naira(r.deposit_kobo):""}</td></tr>`).join("")}
+    </table>` : `<div class="mut">Nothing outstanding.</div>`;
+  const salesTable = rows => rows.length ? `<table><tr><th></th><th>Qty</th><th>Amount</th></tr>
+      ${rows.map(r=>`<tr><td>${esc(r.label)}</td><td>${(r.qty_milli/1000).toLocaleString()}</td><td>${naira(r.value_kobo)}</td></tr>`).join("")}
+    </table>` : `<div class="mut">No sales yet this month.</div>`;
+  box.innerHTML = `
+    <h3>Who owes me</h3>${agingTable(ar,"Customer")}
+    <h3 style="margin-top:22px">Who I owe</h3>${agingTable(ap,"Supplier")}
+    <h3 style="margin-top:22px">Top customers this month</h3>${salesTable(salesC)}
+    <h3 style="margin-top:22px">Top products this month</h3>${salesTable(salesP)}
+    ${drawings>0?`<div class="ok" style="margin-top:16px">You took out ${naira(drawings)} this month <span class="mut">(not a business cost)</span></div>`:""}`;
+}
+
+// ── Formal statements: Income Statement (accrual/cash toggle), Balance Sheet, Cash Flow (§4) ──
+async function renderStatements(){
+  const box = el("reportbody");
+  box.innerHTML = `
+    <div class="row">
+      <div><label>Period</label><select id="stmt-period">
+        <option value="this_month">This month</option>
+        <option value="this_quarter">This quarter</option>
+        <option value="ytd">Year to date</option></select></div>
+      <div><label>Profit basis</label><select id="stmt-basis">
+        <option value="accrual">Accrual — what's owed</option>
+        <option value="cash">Cash — what's actually moved</option></select></div>
+    </div>
+    <div id="stmtbody"></div>`;
+  el("stmt-period").value = STMT_PERIOD; el("stmt-basis").value = STMT_CASH ? "cash" : "accrual";
+  el("stmt-period").onchange = e => { STMT_PERIOD = e.target.value; paintStatements(); };
+  el("stmt-basis").onchange = e => { STMT_CASH = e.target.value === "cash"; paintStatements(); };
+  await paintStatements();
+}
+
+async function paintStatements(){
+  const p = REPORT_PERIODS[STMT_PERIOD];
+  const body = el("stmtbody");
+  body.innerHTML = `<div class="mut">Loading…</div>`;
+  const [is, cb, bs, cf] = await Promise.all([
+    invoke("income_statement_accrual",{companyId:CO.id, start:p.start, end:p.end}),
+    STMT_CASH ? invoke("income_statement_cash_basis",{companyId:CO.id, start:p.start, end:p.end}) : Promise.resolve(null),
+    invoke("balance_sheet",{companyId:CO.id, asOf:p.end}),
+    invoke("cash_flow_statement",{companyId:CO.id, start:p.start, end:p.end}),
+  ]);
+  const acctRows = rows => rows.map(a=>`<tr class="indent"><td>${esc(a.name)}</td><td>${naira(a.amount_kobo)}</td></tr>`).join("");
+  const incomeHtml = STMT_CASH ? `
+    <h3>Profit &amp; Loss — Cash basis</h3><div class="mut">${esc(cb.caption)}</div>
+    <table><tr><td>Money in (collected)</td><td>${naira(cb.revenue_kobo)}</td></tr>
+      <tr><td>Money out (paid)</td><td>${naira(cb.expense_kobo)}</td></tr>
+      <tr class="stmttotal"><td>Net profit</td><td>${naira(cb.net_profit_kobo)}</td></tr></table>`
+    : `<h3>Income Statement — Accrual</h3>
+    <table>
+      <tr class="stmtsection"><td>Revenue</td><td></td></tr>${acctRows(is.revenue)}
+      <tr class="indent" style="font-weight:600"><td>Total revenue</td><td>${naira(is.revenue_total_kobo)}</td></tr>
+      <tr class="stmtsection"><td>Cost of goods sold</td><td></td></tr>${acctRows(is.cogs)}
+      <tr class="indent" style="font-weight:600"><td>Total COGS</td><td>${naira(is.cogs_total_kobo)}</td></tr>
+      <tr class="stmttotal"><td>Gross profit (${(is.gross_margin_bp/100).toFixed(1)}%)</td><td>${naira(is.gross_profit_kobo)}</td></tr>
+      <tr class="stmtsection"><td>Running costs</td><td></td></tr>${acctRows(is.opex)}
+      <tr class="indent" style="font-weight:600"><td>Total running costs</td><td>${naira(is.opex_total_kobo)}</td></tr>
+      <tr class="stmttotal"><td>Operating profit</td><td>${naira(is.operating_profit_kobo)}</td></tr>
+      ${is.non_operating_kobo!==0?`<tr><td>Exchange gain/(loss)</td><td>${naira(is.non_operating_kobo)}</td></tr>`:""}
+      <tr class="stmttotal"><td>Net profit</td><td>${naira(is.net_profit_kobo)}</td></tr>
+    </table>`;
+  const bsHtml = `<h3 style="margin-top:26px">Balance Sheet — as of ${dmy(p.end)}</h3>
+    <table>
+      <tr class="stmtsection"><td>Assets</td><td></td></tr>
+      <tr class="indent"><td>Cash &amp; Bank</td><td>${naira(bs.cash_and_bank_kobo)}</td></tr>
+      <tr class="indent"><td>Owed to us</td><td>${naira(bs.receivables_kobo)}</td></tr>
+      ${bs.inventory_kobo?`<tr class="indent"><td>Stock</td><td>${naira(bs.inventory_kobo)}</td></tr>`:""}
+      <tr class="indent"><td>Equipment &amp; property (net)</td><td>${naira(bs.fixed_assets_net_kobo)}</td></tr>
+      ${bs.other_assets_kobo?`<tr class="indent"><td>Other</td><td>${naira(bs.other_assets_kobo)}</td></tr>`:""}
+      <tr class="stmttotal"><td>Total assets</td><td>${naira(bs.total_assets_kobo)}</td></tr>
+      <tr class="stmtsection"><td>What we owe</td><td></td></tr>
+      <tr class="indent"><td>Owed to suppliers &amp; tax</td><td>${naira(bs.current_liabilities_kobo)}</td></tr>
+      ${bs.loans_kobo?`<tr class="indent"><td>Loans</td><td>${naira(bs.loans_kobo)}</td></tr>`:""}
+      ${bs.other_liabilities_kobo?`<tr class="indent"><td>Other</td><td>${naira(bs.other_liabilities_kobo)}</td></tr>`:""}
+      <tr class="stmttotal"><td>Total owed</td><td>${naira(bs.total_liabilities_kobo)}</td></tr>
+      <tr class="stmtsection"><td>Owner's equity</td><td></td></tr>
+      ${bs.opening_balance_equity_kobo?`<tr class="indent"><td>Opening balance</td><td>${naira(bs.opening_balance_equity_kobo)}</td></tr>`:""}
+      <tr class="indent"><td>Owner's capital</td><td>${naira(bs.owner_capital_kobo)}</td></tr>
+      <tr class="indent"><td>Owner's drawings</td><td>${naira(bs.drawings_kobo)}</td></tr>
+      <tr class="indent"><td>Retained earnings</td><td>${naira(bs.retained_earnings_kobo)}</td></tr>
+      <tr class="indent"><td>Profit this year</td><td>${naira(bs.current_year_earnings_kobo)}</td></tr>
+      <tr class="stmttotal"><td>Total equity</td><td>${naira(bs.total_equity_kobo)}</td></tr>
+    </table>
+    <div class="${bs.ties?"tie-ok":"tie-bad"}" style="margin-top:6px">${bs.ties?"✓ Balanced":"✗ NOT BALANCED — tell your advisor"}</div>`;
+  const cfHtml = `<h3 style="margin-top:26px">Cash Flow</h3>
+    <table>
+      <tr><td>From running the business</td><td>${naira(cf.operating_kobo)}</td></tr>
+      <tr><td>From buying/selling equipment</td><td>${naira(cf.investing_kobo)}</td></tr>
+      <tr><td>From loans &amp; owner's money</td><td>${naira(cf.financing_kobo)}</td></tr>
+      <tr class="stmttotal"><td>Net change in cash</td><td>${naira(cf.net_change_kobo)}</td></tr>
+      <tr><td>Cash at start</td><td>${naira(cf.opening_cash_kobo)}</td></tr>
+      <tr><td>Cash at end</td><td>${naira(cf.closing_cash_kobo)}</td></tr>
+    </table>`;
+  body.innerHTML = incomeHtml + bsHtml + cfHtml;
+}
+
+// ── Tax reports: VAT (calendar-monthly, Spec 05 §5.1) + WHT schedules (§5.2) ──
+async function renderTaxReports(){
+  const box = el("reportbody");
+  const now = new Date();
+  if (!TAX_YM) TAX_YM = { y: now.getFullYear(), m: now.getMonth() + 1 };
+  box.innerHTML = `
+    <div class="row"><div><label>Month</label>
+      <input type="month" id="tax-month" value="${TAX_YM.y}-${String(TAX_YM.m).padStart(2,"0")}"/></div></div>
+    <div id="taxbody"></div>`;
+  el("tax-month").onchange = e => { const [y,m] = e.target.value.split("-").map(Number); TAX_YM = {y,m}; paintTax(); };
+  await paintTax();
+}
+
+async function paintTax(){
+  const body = el("taxbody");
+  body.innerHTML = `<div class="mut">Loading…</div>`;
+  const monthStart = `${TAX_YM.y}-${String(TAX_YM.m).padStart(2,"0")}-01`;
+  const lastDay = new Date(TAX_YM.y, TAX_YM.m, 0).getDate();
+  const monthEnd = `${TAX_YM.y}-${String(TAX_YM.m).padStart(2,"0")}-${String(lastDay).padStart(2,"0")}`;
+  const [vat, remit, credit, cumCredit] = await Promise.all([
+    invoke("vat_report",{companyId:CO.id, monthStart, monthEnd}),
+    invoke("wht_remittance_schedule",{companyId:CO.id, start:monthStart, end:monthEnd}),
+    invoke("wht_credit_schedule",{companyId:CO.id, start:monthStart, end:monthEnd}),
+    invoke("wht_cumulative_credit",{companyId:CO.id, asOf:monthEnd}),
+  ]);
+  body.innerHTML = `
+    <h3>VAT — due by the 21st of next month</h3>
+    <table><tr><th>Document</th><th>Party</th><th>TIN</th><th>Net</th><th>VAT</th></tr>
+      <tr class="stmtsection"><td colspan="5">Tax collected on sales</td></tr>
+      ${vat.output.map(l=>`<tr><td>${esc(l.doc_number)}</td><td>${esc(l.party_name)}</td><td>${esc(l.tin||"")}</td><td>${naira(l.net_kobo)}</td><td>${naira(l.vat_kobo)}</td></tr>`).join("")}
+      <tr class="indent" style="font-weight:600"><td colspan="4">Total collected</td><td>${naira(vat.output_vat_kobo)}</td></tr>
+      <tr class="stmtsection"><td colspan="5">Tax paid on purchases</td></tr>
+      ${vat.input.map(l=>`<tr><td>${esc(l.doc_number)}</td><td>${esc(l.party_name)}</td><td>${esc(l.tin||"")}</td><td>${naira(l.net_kobo)}</td><td>${naira(l.vat_kobo)}</td></tr>`).join("")}
+      <tr class="indent" style="font-weight:600"><td colspan="4">Total paid</td><td>${naira(vat.input_vat_kobo)}</td></tr>
+      <tr class="stmttotal"><td colspan="4">Net payable this month</td><td>${naira(vat.net_payable_kobo)}</td></tr>
+      ${vat.credit_brought_forward_kobo>0?`<tr><td colspan="4">Credit from before</td><td>${naira(vat.credit_brought_forward_kobo)}</td></tr>`:""}
+      <tr class="stmttotal"><td colspan="4">Amount to pay FIRS</td><td>${naira(Math.max(0,vat.net_due_kobo))}</td></tr>
+    </table>
+    <h3 style="margin-top:22px">Tax held back from suppliers (to remit)</h3>
+    ${remit.length?`<table><tr><th>Date</th><th>Supplier</th><th>TIN</th><th>Bill</th><th>Base</th><th>Tax held</th></tr>
+      ${remit.map(l=>`<tr><td>${dmy(l.payment_date)}</td><td>${esc(l.supplier_name)}</td><td>${esc(l.tin||"")}</td><td>${esc(l.bill_ref||"")}</td><td>${naira(l.base_kobo)}</td><td>${naira(l.wht_kobo)}</td></tr>`).join("")}
+      </table>`:`<div class="mut">None this month.</div>`}
+    <h3 style="margin-top:22px">Tax customers held back from us</h3>
+    ${credit.length?`<table><tr><th>Date</th><th>Customer</th><th>TIN</th><th>Base</th><th>Tax held</th></tr>
+      ${credit.map(l=>`<tr><td>${dmy(l.receipt_date)}</td><td>${esc(l.customer_name)}</td><td>${esc(l.tin||"")}</td><td>${naira(l.base_kobo)}</td><td>${naira(l.wht_kobo)}</td></tr>`).join("")}
+      </table>`:`<div class="mut">None this month.</div>`}
+    <div class="ok" style="margin-top:12px">Total tax credit available so far: ${naira(cumCredit)} <span class="mut">(can offset company income tax)</span></div>`;
+}
+
+// ── Advisor tier: Trial Balance + General Ledger (§4.5) — the first real
+//    UI consumer of require_advisor_elevated; not shown at all to staff,
+//    and shows a plain-language nudge (not an error) when not yet elevated.
+async function renderAdvisorReports(){
+  const box = el("reportbody");
+  if (SESSION.role === "staff"){ box.innerHTML = `<div class="mut">Not available for your role.</div>`; return; }
+  if (!SESSION.advisor_active){
+    box.innerHTML = `<div class="mut">Enter Advisor Mode (top right) to see the trial balance and general ledger.</div>`;
+    return;
+  }
+  const asOf = today();
+  box.innerHTML = `<div class="mut">Loading…</div>`;
+  try {
+    const [tb, accounts] = await Promise.all([
+      invoke("trial_balance",{companyId:CO.id, asOf}),
+      invoke("list_accounts",{companyId:CO.id}),
+    ]);
+    const shown = tb.filter(r => r.debit_kobo !== 0 || r.credit_kobo !== 0);
+    const totalDr = shown.reduce((t,r)=>t+r.debit_kobo,0), totalCr = shown.reduce((t,r)=>t+r.credit_kobo,0);
+    box.innerHTML = `
+      <h3>Trial Balance — as of ${dmy(asOf)}</h3>
+      <table><tr><th>Code</th><th>Account</th><th>Debit</th><th>Credit</th></tr>
+        ${shown.map(r=>`<tr><td>${esc(r.code)}</td><td>${esc(r.name)}</td><td>${r.debit_kobo?naira(r.debit_kobo):""}</td><td>${r.credit_kobo?naira(r.credit_kobo):""}</td></tr>`).join("")}
+        <tr class="stmttotal"><td colspan="2">Total</td><td>${naira(totalDr)}</td><td>${naira(totalCr)}</td></tr>
+      </table>
+      <h3 style="margin-top:22px">General Ledger</h3>
+      <div class="row">
+        <div><label>Account</label><select id="gl-acct">${accounts.map(a=>`<option value="${a.id}">${esc(a.code)} — ${esc(a.name)}</option>`).join("")}</select></div>
+        <div><label>From</label><input type="date" id="gl-from" value="${REPORT_PERIODS.ytd.start}"/></div>
+        <div><label>To</label><input type="date" id="gl-to" value="${asOf}"/></div>
+        <div style="display:flex;align-items:flex-end"><button class="ghost" id="gl-go" style="width:100%">Show</button></div>
+      </div>
+      <div id="glbody"></div>`;
+    el("gl-go").onclick = async () => {
+      try {
+        const gl = await invoke("general_ledger",{accountId:el("gl-acct").value, companyId:CO.id,
+          start:el("gl-from").value, end:el("gl-to").value, contactId:null});
+        el("glbody").innerHTML = `<table><tr><th>Date</th><th>Memo</th><th>Who</th><th>Amount</th><th>Balance</th></tr>
+          <tr><td colspan="4">Opening balance</td><td>${naira(gl.opening_balance_kobo)}</td></tr>
+          ${gl.lines.map(l=>`<tr><td>${dmy(l.date)}</td><td>${esc(l.memo)}</td><td>${esc(l.contact_name||"")}</td><td>${naira(l.amount_kobo)}</td><td>${naira(l.running_balance_kobo)}</td></tr>`).join("")}
+          <tr class="stmttotal"><td colspan="4">Closing balance</td><td>${naira(gl.closing_balance_kobo)}</td></tr>
+        </table>`;
+      } catch(e){ err(e); }
+    };
+  } catch(e){ err(e); }
 }
 
 let toastTimer;
