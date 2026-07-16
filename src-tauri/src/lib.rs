@@ -117,6 +117,16 @@ impl From<EngineError> for CmdError {
                 ),
                 detail: None,
             },
+            EngineError::WriteOffAboveLimit { limit_kobo } => CmdError {
+                code: "writeoff_above_limit",
+                message: format!(
+                    "This is more than your write-off limit ({}). It can't be written off here — \
+                     your advisor needs to record it as a journal entry, then match this line to it \
+                     the normal way.",
+                    naira(*limit_kobo)
+                ),
+                detail: None,
+            },
         }
     }
 }

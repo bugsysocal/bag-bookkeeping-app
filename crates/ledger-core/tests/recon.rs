@@ -113,7 +113,12 @@ fn full_reconciliation_flow_with_needs_review_carry_forward() {
         "SELECT id FROM reconciliation_lines WHERE reconciliation_id = ?1 AND stmt_amount_kobo = 30000000",
         params![recon], |r| r.get(0),
     ).unwrap();
-    assert!(write_off(&mut w.conn, &mystery, "?", &ctx).is_err());
+    // Spec 04 §9 Decision #11 (closed, final): no bypass, ever — the engine
+    // doesn't even accept a "this session is elevated" signal to write_off.
+    assert!(matches!(
+        write_off(&mut w.conn, &mystery, "?", &ctx),
+        Err(ledger_core::engine::EngineError::WriteOffAboveLimit { limit_kobo: 500_000 })
+    ));
     assert!(flag_needs_review(&w.conn, &mystery, "   ", None).is_err());
     let entries_before: i64 = w.conn.query_row(
         "SELECT COUNT(*) FROM journal_entries", [], |r| r.get(0)).unwrap();
@@ -192,4 +197,54 @@ fn manual_match_is_sum_exact_one_to_many() {
 
     // Fully decided, no flags → plain 'completed'.
     assert_eq!(complete(&mut w.conn, &recon).unwrap(), "completed");
+}
+
+// ===== Spec 04 §9 Decision #11 (closed, final): the sanctioned resolution
+// path for an above-limit line — a manual journal entry, matched via the
+// ordinary manual-match flow. No write-off bypass exists at any elevation. =====
+
+#[test]
+fn above_limit_line_resolves_via_manual_journal_and_ordinary_match_not_a_bypass() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+
+    let recon = start_reconciliation(&mut w.conn, &w.company, &w.bank, "2026-07-31", 300_000_00).unwrap();
+    import_rows(&mut w.conn, &recon, &[StmtRow {
+        date: "2026-07-15".into(), description: "UNKNOWN CREDIT REF 8841".into(), amount_kobo: 300_000_00,
+    }]).unwrap();
+    let mystery: String = w.conn.query_row(
+        "SELECT id FROM reconciliation_lines WHERE reconciliation_id = ?1", params![recon], |r| r.get(0),
+    ).unwrap();
+
+    // Decision #11: write_off refuses unconditionally above the limit — this
+    // is the ONLY check the engine performs; there is no elevation parameter
+    // to pass in the first place, so "even an elevated advisor" is not a
+    // distinct code path to bypass, it simply doesn't exist.
+    assert!(matches!(
+        write_off(&mut w.conn, &mystery, "too large, needs a real journal", &ctx),
+        Err(ledger_core::engine::EngineError::WriteOffAboveLimit { .. })
+    ));
+
+    // The sanctioned path: an ordinary manual journal (this is what "Advisor
+    // Mode" means here — a real posting through the one posting surface,
+    // not a special override), then the ordinary manual-match flow.
+    let other_income: String = w.conn.query_row(
+        "SELECT id FROM accounts WHERE company_id = ?1 AND code = '4200'", params![w.company], |r| r.get(0),
+    ).unwrap();
+    let entry_id = ledger_core::engine::post_journal(
+        &mut w.conn, &w.company, "2026-07-15",
+        "Unidentified bank credit, resolved after review — ref 8841", "manual", &ctx,
+        &[LineSpec::new(&w.bank_coa, 300_000_00), LineSpec::new(&other_income, -300_000_00)],
+    ).unwrap();
+    let bank_leg: String = w.conn.query_row(
+        "SELECT id FROM journal_lines WHERE entry_id = ?1 AND account_id = ?2",
+        params![entry_id, w.bank_coa], |r| r.get(0),
+    ).unwrap();
+
+    manual_match(&mut w.conn, &mystery, &[bank_leg], "manual").unwrap();
+    let state: String = w.conn.query_row(
+        "SELECT state FROM reconciliation_lines WHERE id = ?1", params![mystery], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(state, "matched");
+    assert_eq!(complete(&mut w.conn, &recon).unwrap(), "completed", "no needs-review lines left, no exceptions");
 }

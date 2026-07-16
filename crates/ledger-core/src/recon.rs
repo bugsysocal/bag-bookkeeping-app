@@ -381,10 +381,13 @@ pub fn write_off(conn: &mut Connection, line_id: &str, note: &str, ctx: &PostCtx
          FROM companies WHERE id = ?1",
         params![company_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    // Spec 04 §9 Decision #11 (final, no bypass): above the limit, this
+    // function refuses unconditionally — for every role, elevated or not.
+    // The resolution path is a manual journal entry (Advisor Mode) matched
+    // back to this line via the ordinary manual-match flow, not an override
+    // here.
     if amount.abs() > limit {
-        return Err(EngineError::Validation(
-            "this is above your write-off limit — your advisor can record it from their review".into(),
-        ));
+        return Err(EngineError::WriteOffAboveLimit { limit_kobo: limit });
     }
     let by_code = |code: &str, tx: &Connection| -> R<String> {
         Ok(tx.query_row(

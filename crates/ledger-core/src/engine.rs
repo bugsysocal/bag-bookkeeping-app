@@ -35,6 +35,13 @@ pub enum EngineError {
     AdvisorPinIncorrect { attempts_remaining: u32 },
     #[error("advisor mode locked, {minutes_left} minute(s) remaining")]
     AdvisorLockedOut { minutes_left: u64 },
+    /// Spec 04 §7.5/§9 Decision #11 (CLOSED, final): there is no in-app bypass
+    /// of the write-off limit, for any role, ever, elevated or not. Above the
+    /// limit the line is resolved by posting a manual journal (Advisor Mode,
+    /// `post_journal`) and matching this statement line to it via the
+    /// ordinary manual-match flow — no separate "override" mechanism exists.
+    #[error("write-off above the limit ({limit_kobo} kobo) — record a manual journal entry and match it instead")]
+    WriteOffAboveLimit { limit_kobo: i64 },
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
 }
