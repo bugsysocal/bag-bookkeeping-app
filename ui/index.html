@@ -391,6 +391,8 @@ function chrome(active, body){
       <a class="navlink" id="n-pur">Purchases</a>
       <a class="navlink" id="n-bank">Bank &amp; Cash</a>
       <a class="navlink" id="n-pays">Payments</a>
+      <a class="navlink" id="n-contacts">Contacts</a>
+      <a class="navlink" id="n-products">Products</a>
       <a class="navlink" id="n-reports">Reports</a>
       <span class="spacer"></span>
       <button id="a-newinv">New Invoice</button>
@@ -400,6 +402,8 @@ function chrome(active, body){
   el("n-home").onclick = viewDashboard; el("n-inv").onclick = viewInvoices;
   el("n-pur").onclick = viewPurchases; el("n-bank").onclick = viewBank;
   el("n-pays").onclick = viewPayments; el("n-reports").onclick = () => viewReports();
+  el("n-contacts").onclick = viewContacts;
+  el("n-products").onclick = viewProducts;
   el("a-newinv").onclick = () => viewNewInvoice(false);
   el("a-exp").onclick = viewRecordExpense;
   el("a-pay").onclick = () => viewRecordPayment();
@@ -470,7 +474,16 @@ async function viewInvoices(){
       }).join("")}</table></div>`
     : `<div class="card"><h3>Sales</h3><div class="mut">No invoices yet — create your first with the button above.</div>
        <button class="ghost" id="newquote">New quote</button></div>`;
-  chrome("inv", body);
+  const importPanel = `<div class="card"><details><summary class="mut">Import open invoices from a previous system</summary>
+    <div class="mut" style="margin:8px 0">Columns, in this order: invoice_no, customer, issue_date, due_date, original_total,
+      balance_outstanding. Only the amount still owed is brought onto your books — never the full original total, and
+      never as sales income (it was already earned before LedgerOne). The first row is treated as a header and skipped.
+      <a class="navlink" id="oi-template">Download a blank template</a></div>
+    <div class="row"><div><label>File (.xlsx or .csv)</label><input type="file" id="oifile" accept=".xlsx,.xls,.csv,.txt"/></div></div>
+    <button class="ghost" id="oi-preview" style="margin-top:8px">Preview</button>
+    <div id="oi-previewarea"></div>
+  </details></div>`;
+  chrome("inv", body + importPanel);
   el("newquote") && (el("newquote").onclick = () => viewNewInvoice(true));
   document.querySelectorAll("[data-act]").forEach(a => a.onclick = async () => {
     const id = a.dataset.id;
@@ -485,6 +498,52 @@ async function viewInvoices(){
       viewInvoices();
     } catch(e){ err(e); }
   });
+
+  el("oi-template").onclick = () => downloadCsv("open-invoices-template.csv", [
+    ["invoice_no","customer","issue_date","due_date","original_total","balance_outstanding"],
+    ["INV-2031","Zenith Traders","01/03/2026","31/03/2026","500000","200000"],
+  ]);
+
+  let previewRows = null;
+  let currentFilename = null;
+
+  el("oi-preview").onclick = async () => {
+    const f = el("oifile").files[0];
+    if (!f) return err({message:"Choose a file to import first."});
+    currentFilename = f.name;
+    const b64 = arrayBufferToBase64(await f.arrayBuffer());
+    try {
+      previewRows = await invoke("import_open_invoices_preview",{companyId:CO.id, filename:f.name, fileBase64:b64});
+      renderPreview();
+    } catch(e){ err(e); }
+  };
+
+  function renderPreview(){
+    const okCount = previewRows.filter(r=>r.status!=="error").length;
+    const area = el("oi-previewarea");
+    area.innerHTML = `<table style="margin-top:10px"><tr><th>Row</th><th>Invoice</th><th>Customer</th><th>Balance</th><th>Status</th><th>Note</th></tr>
+      ${previewRows.map(r=>{
+        const [cls,lbl] = CONTACT_ROW_CHIP[r.status];
+        return `<tr><td>${r.row_num}</td><td>${esc(r.invoice_no)}</td><td>${esc(r.customer_name)}</td>
+          <td>${naira(r.balance_outstanding_kobo)}</td><td><span class="chip ${cls}">${lbl}</span></td>
+          <td class="mut">${esc(r.message||"")}</td></tr>`;
+      }).join("")}</table>
+      <div class="mut" style="margin:8px 0">${okCount} of ${previewRows.length} row(s) will be imported.</div>
+      <button id="oi-commit" ${okCount===0?"disabled":""}>Import ${okCount} invoice(s)</button>`;
+    el("oi-commit").onclick = async () => {
+      try {
+        const res = await invoke("import_open_invoices_commit",{companyId:CO.id, filename:currentFilename, rows:previewRows});
+        toast(`${res.rows_ok} invoice(s) imported${res.rows_error?`, ${res.rows_error} skipped`:""}.`);
+        if (res.exceptions.length){
+          downloadCsv(`${currentFilename}-exceptions.csv`, [
+            ["row_num","invoice_no","customer","issue_date","due_date","original_total_kobo","balance_outstanding_kobo","status","Rejection reason"],
+            ...res.exceptions.map(r=>[r.row_num,r.invoice_no,r.customer_name,r.issue_date,r.due_date,r.original_total_kobo,r.balance_outstanding_kobo,r.status,r.message||""]),
+          ]);
+        }
+        viewInvoices();
+      } catch(e){ err(e); }
+    };
+  }
 }
 
 // ── Printable document view (Spec 03 §7): print via the system dialog
@@ -718,10 +777,65 @@ async function viewPurchases(){
           <td><span class="chip ${chip}">${label}</span></td><td>${naira(r.total_kobo)}</td><td>${naira(r.total_kobo-r.paid_kobo)}</td></tr>`;
       }).join("")}</table>`
       : `<div class="mut">No supplier bills yet. Quick one-off costs go through <b>Record Expense</b>; bills you'll pay later are recorded here.</div>`}
-    </div>`;
+    </div>
+    <details style="margin-top:16px"><summary class="mut">Import open bills from a previous system</summary>
+      <div class="mut" style="margin:8px 0">Columns, in this order: supplier, reference, bill_date, due_date, original_total,
+        balance_outstanding, wht_applicable (yes/no), wht_rate (percent, e.g. 5 for 5%). Only the amount still owed is
+        brought onto your books — never as an expense. The first row is treated as a header and skipped.
+        <a class="navlink" id="ob-template">Download a blank template</a></div>
+      <div class="row"><div><label>File (.xlsx or .csv)</label><input type="file" id="obfile" accept=".xlsx,.xls,.csv,.txt"/></div></div>
+      <button class="ghost" id="ob-preview" style="margin-top:8px">Preview</button>
+      <div id="ob-previewarea"></div>
+    </details></div>`;
   chrome("pur", body);
   el("newbill").onclick = viewNewBill;
   el("paysup").onclick = viewPaySupplier;
+
+  el("ob-template").onclick = () => downloadCsv("open-bills-template.csv", [
+    ["supplier","reference","bill_date","due_date","original_total","balance_outstanding","wht_applicable","wht_rate"],
+    ["Okoro Supplies","SUP-118","01/03/2026","31/03/2026","300000","300000","no",""],
+  ]);
+
+  let previewRows = null;
+  let currentFilename = null;
+
+  el("ob-preview").onclick = async () => {
+    const f = el("obfile").files[0];
+    if (!f) return err({message:"Choose a file to import first."});
+    currentFilename = f.name;
+    const b64 = arrayBufferToBase64(await f.arrayBuffer());
+    try {
+      previewRows = await invoke("import_open_bills_preview",{companyId:CO.id, filename:f.name, fileBase64:b64});
+      renderPreview();
+    } catch(e){ err(e); }
+  };
+
+  function renderPreview(){
+    const okCount = previewRows.filter(r=>r.status!=="error").length;
+    const area = el("ob-previewarea");
+    area.innerHTML = `<table style="margin-top:10px"><tr><th>Row</th><th>Supplier</th><th>Ref</th><th>Balance</th><th>Status</th><th>Note</th></tr>
+      ${previewRows.map(r=>{
+        const [cls,lbl] = CONTACT_ROW_CHIP[r.status];
+        return `<tr><td>${r.row_num}</td><td>${esc(r.supplier_name)}</td><td>${esc(r.reference||"")}</td>
+          <td>${naira(r.balance_outstanding_kobo)}</td><td><span class="chip ${cls}">${lbl}</span></td>
+          <td class="mut">${esc(r.message||"")}</td></tr>`;
+      }).join("")}</table>
+      <div class="mut" style="margin:8px 0">${okCount} of ${previewRows.length} row(s) will be imported.</div>
+      <button id="ob-commit" ${okCount===0?"disabled":""}>Import ${okCount} bill(s)</button>`;
+    el("ob-commit").onclick = async () => {
+      try {
+        const res = await invoke("import_open_bills_commit",{companyId:CO.id, filename:currentFilename, rows:previewRows});
+        toast(`${res.rows_ok} bill(s) imported${res.rows_error?`, ${res.rows_error} skipped`:""}.`);
+        if (res.exceptions.length){
+          downloadCsv(`${currentFilename}-exceptions.csv`, [
+            ["row_num","supplier","reference","bill_date","due_date","original_total_kobo","balance_outstanding_kobo","wht_applicable","wht_rate_bp","status","Rejection reason"],
+            ...res.exceptions.map(r=>[r.row_num,r.supplier_name,r.reference||"",r.bill_date,r.due_date,r.original_total_kobo,r.balance_outstanding_kobo,r.wht_applicable,r.wht_rate_bp||"",r.status,r.message||""]),
+          ]);
+        }
+        viewPurchases();
+      } catch(e){ err(e); }
+    };
+  }
 }
 
 // ── Quick expense (Spec 04 §2): paid now, no supplier account needed
@@ -1088,6 +1202,161 @@ async function viewRecon(bankId, label){
       viewBank();
     } catch(e){ err(e); }
   };
+}
+
+// ════════ Contacts + onboarding import (Spec 06 §3) ════════
+
+function arrayBufferToBase64(buf){
+  let binary = "";
+  const bytes = new Uint8Array(buf);
+  const chunk = 0x8000;
+  for (let i=0; i<bytes.length; i+=chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+  return btoa(binary);
+}
+
+const csvCell = s => /[",\n]/.test(s) ? '"' + String(s).replace(/"/g,'""') + '"' : String(s);
+
+function downloadCsv(filename, rows){
+  const blob = new Blob([rows.map(r => r.map(csvCell).join(",")).join("\n")], {type:"text/csv"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+const CONTACT_ROW_CHIP = { ready:["paid","Ready"], warning:["partially_paid","Warning"], error:["overdue","Error"] };
+
+async function viewContacts(){
+  const [customers, suppliers] = await Promise.all([
+    invoke("list_contacts",{companyId:CO.id, kind:"customer"}),
+    invoke("list_contacts",{companyId:CO.id, kind:"supplier"}),
+  ]);
+  const listTable = list => `<table><tr><th>Name</th><th>Phone</th></tr>
+    ${list.map(c=>`<tr><td>${esc(c.name)}</td><td>${esc(c.phone||"")}</td></tr>`).join("")}</table>`;
+
+  chrome("contacts", `<div class="card"><h3>Contacts</h3>
+    <div class="row">
+      <div><h4 style="margin:0 0 4px">Customers (${customers.length})</h4>${listTable(customers)}</div>
+      <div><h4 style="margin:0 0 4px">Suppliers (${suppliers.length})</h4>${listTable(suppliers)}</div>
+    </div>
+    <details style="margin-top:16px"><summary class="mut">Import contacts from a file</summary>
+      <div class="mut" style="margin:8px 0">Columns, in this order: name, kind (customer/supplier/both), phone, email, TIN,
+        address, terms days. The first row is treated as a header and skipped.
+        <a class="navlink" id="c-template">Download a blank template</a></div>
+      <div class="row"><div><label>File (.xlsx or .csv)</label><input type="file" id="cfile" accept=".xlsx,.xls,.csv,.txt"/></div></div>
+      <button class="ghost" id="c-preview" style="margin-top:8px">Preview</button>
+      <div id="c-previewarea"></div>
+    </details></div>`);
+
+  el("c-template").onclick = () => downloadCsv("contacts-template.csv", [
+    ["name","kind","phone","email","tin","address","terms_days"],
+    ["Ada Traders","customer","08030000000","ada@example.com","","Lagos","30"],
+  ]);
+
+  let previewRows = null;
+  let currentFilename = null;
+
+  el("c-preview").onclick = async () => {
+    const f = el("cfile").files[0];
+    if (!f) return err({message:"Choose a file to import first."});
+    currentFilename = f.name;
+    const b64 = arrayBufferToBase64(await f.arrayBuffer());
+    try {
+      previewRows = await invoke("import_contacts_preview",{companyId:CO.id, filename:f.name, fileBase64:b64});
+      renderContactPreview();
+    } catch(e){ err(e); }
+  };
+
+  function renderContactPreview(){
+    const readyCount = previewRows.filter(r=>r.status==="ready").length;
+    const area = el("c-previewarea");
+    area.innerHTML = `<table style="margin-top:10px"><tr><th>Row</th><th>Name</th><th>Kind</th><th>Phone</th><th>Status</th><th>Note</th></tr>
+      ${previewRows.map(r=>{
+        const [cls,lbl] = CONTACT_ROW_CHIP[r.status];
+        return `<tr><td>${r.row_num}</td><td>${esc(r.name)}</td><td>${esc(r.kind)}</td><td>${esc(r.phone||"")}</td>
+          <td><span class="chip ${cls}">${lbl}</span></td><td class="mut">${esc(r.message||"")}</td></tr>`;
+      }).join("")}</table>
+      <div class="mut" style="margin:8px 0">${readyCount} of ${previewRows.length} row(s) will be imported.</div>
+      <button id="c-commit" ${readyCount===0?"disabled":""}>Import ${readyCount} contact(s)</button>`;
+    el("c-commit").onclick = async () => {
+      try {
+        const res = await invoke("import_contacts_commit",{companyId:CO.id, filename:currentFilename, rows:previewRows});
+        toast(`${res.rows_ok} contact(s) imported${res.rows_error?`, ${res.rows_error} skipped`:""}.`);
+        if (res.exceptions.length){
+          downloadCsv(`${currentFilename}-exceptions.csv`, [
+            ["row_num","name","kind","phone","email","tin","address","terms_days","status","Rejection reason"],
+            ...res.exceptions.map(r=>[r.row_num,r.name,r.kind,r.phone||"",r.email||"",r.tin||"",r.address||"",r.terms_days,r.status,r.message||""]),
+          ]);
+        }
+        viewContacts();
+      } catch(e){ err(e); }
+    };
+  }
+}
+
+async function viewProducts(){
+  const products = await invoke("list_products",{companyId:CO.id});
+  const listTable = `<table><tr><th>Name</th><th>Kind</th><th>SKU</th><th>Sale price</th><th>Tracks stock</th></tr>
+    ${products.map(p=>`<tr><td>${esc(p.name)}</td><td>${esc(p.kind)}</td><td>${esc(p.sku||"")}</td>
+      <td>${naira(p.sale_price_kobo)}</td><td>${p.track_inventory?"Yes":""}</td></tr>`).join("")}</table>`;
+
+  chrome("products", `<div class="card"><h3>Products &amp; Services (${products.length})</h3>${listTable}
+    <details style="margin-top:16px"><summary class="mut">Import products from a file</summary>
+      <div class="mut" style="margin:8px 0">Columns, in this order: name, kind (product/service), sku, sale_price,
+        is_vatable (yes/no), qty_on_hand, unit_cost. The last two only matter if you track stock, and if given, need
+        each other. The first row is treated as a header and skipped.
+        <a class="navlink" id="p-template">Download a blank template</a></div>
+      <div class="row">
+        <div><label>File (.xlsx or .csv)</label><input type="file" id="pfile" accept=".xlsx,.xls,.csv,.txt"/></div>
+        <div><label>Opening stock date</label><input type="date" id="pdate" value="${today()}"/></div>
+      </div>
+      <button class="ghost" id="p-preview" style="margin-top:8px">Preview</button>
+      <div id="p-previewarea"></div>
+    </details></div>`);
+
+  el("p-template").onclick = () => downloadCsv("products-template.csv", [
+    ["name","kind","sku","sale_price","is_vatable","qty_on_hand","unit_cost"],
+    ["Widget","product","SKU-001","1500","yes","10","900"],
+  ]);
+
+  let previewRows = null;
+  let currentFilename = null;
+
+  el("p-preview").onclick = async () => {
+    const f = el("pfile").files[0];
+    if (!f) return err({message:"Choose a file to import first."});
+    currentFilename = f.name;
+    const b64 = arrayBufferToBase64(await f.arrayBuffer());
+    try {
+      previewRows = await invoke("import_products_preview",{companyId:CO.id, filename:f.name, fileBase64:b64});
+      renderProductPreview();
+    } catch(e){ err(e); }
+  };
+
+  function renderProductPreview(){
+    const readyCount = previewRows.filter(r=>r.status==="ready").length;
+    const area = el("p-previewarea");
+    area.innerHTML = `<table style="margin-top:10px"><tr><th>Row</th><th>Name</th><th>Kind</th><th>SKU</th><th>Status</th><th>Note</th></tr>
+      ${previewRows.map(r=>{
+        const [cls,lbl] = CONTACT_ROW_CHIP[r.status];
+        return `<tr><td>${r.row_num}</td><td>${esc(r.name)}</td><td>${esc(r.kind)}</td><td>${esc(r.sku||"")}</td>
+          <td><span class="chip ${cls}">${lbl}</span></td><td class="mut">${esc(r.message||"")}</td></tr>`;
+      }).join("")}</table>
+      <div class="mut" style="margin:8px 0">${readyCount} of ${previewRows.length} row(s) will be imported.</div>
+      <button id="p-commit" ${readyCount===0?"disabled":""}>Import ${readyCount} product(s)</button>`;
+    el("p-commit").onclick = async () => {
+      try {
+        const res = await invoke("import_products_commit",{companyId:CO.id, filename:currentFilename, postingDate:el("pdate").value, rows:previewRows});
+        toast(`${res.rows_ok} product(s) imported${res.rows_error?`, ${res.rows_error} skipped`:""}.`);
+        if (res.exceptions.length){
+          downloadCsv(`${currentFilename}-exceptions.csv`, [
+            ["row_num","name","kind","sku","sale_price_kobo","is_vatable","qty_on_hand_milli","unit_cost_kobo","status","Rejection reason"],
+            ...res.exceptions.map(r=>[r.row_num,r.name,r.kind,r.sku||"",r.sale_price_kobo,r.is_vatable,r.qty_on_hand_milli,r.unit_cost_kobo,r.status,r.message||""]),
+          ]);
+        }
+        viewProducts();
+      } catch(e){ err(e); }
+    };
+  }
 }
 
 // ════════ Payments register + voids (Spec 03 §6) ════════

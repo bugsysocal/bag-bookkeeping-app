@@ -5,7 +5,7 @@
 use ledger_core::engine::*;
 use ledger_core::ids::{new_id, now_iso};
 use ledger_core::seed::{add_bank_account, create_company, CompanyConfig, COA_SEED_COUNT};
-use ledger_core::PostCtx;
+use ledger_core::{LineSpec, PostCtx};
 use rusqlite::{params, Connection};
 
 struct World {
@@ -883,4 +883,101 @@ fn soft_close_requires_confirmation_then_proceeds() {
 
     let confirmed = PostCtx { confirm_soft_close: true, ..Default::default() };
     post_drawing(&mut w.conn, &w.company, &w.bank, "2026-06-15", 10_000_00, false, &confirmed).unwrap();
+}
+
+// ===== Historical open-document import (Spec 06 §3.1) =====
+
+#[test]
+fn import_open_invoice_posts_ar_and_obe_never_revenue_or_vat() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    let inv = import_open_invoice(
+        &mut w.conn, &w.company, &w.customer, "OLD-INV-001", "2026-03-01", "2026-03-15", "2026-03-01",
+        500_000_00, 200_000_00, &ctx,
+    ).unwrap();
+
+    let entry_id: String = w.conn.query_row(
+        "SELECT journal_entry_id FROM invoices WHERE id = ?1", params![inv], |r| r.get(0),
+    ).unwrap();
+    let lines = entry_lines(&w.conn, &entry_id);
+    // Exactly Dr AR 200,000 (the outstanding balance, not the original 500,000) / Cr OBE — nothing else.
+    assert_eq!(lines.len(), 2);
+    assert!(lines.iter().any(|(acct,amt,_)| acct=="1100" && *amt==200_000_00));
+    assert!(lines.iter().any(|(acct,amt,_)| acct=="3000" && *amt==-200_000_00));
+    assert!(!lines.iter().any(|(acct,_,_)| acct=="4000"), "must never credit revenue");
+    assert!(!lines.iter().any(|(acct,_,_)| acct=="2210"), "must never credit VAT output");
+
+    let (status, total, paid, number): (String, i64, i64, String) = w.conn.query_row(
+        "SELECT status, total_kobo, amount_paid_kobo, number FROM invoices WHERE id = ?1", params![inv],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ).unwrap();
+    assert_eq!((status.as_str(), total, paid), ("partially_paid", 500_000_00, 300_000_00));
+    assert_eq!(number, "OLD-INV-001", "the historical invoice number is kept, not re-numbered");
+    assert_eq!(trial_balance(&w.conn), 0);
+
+    // A payment can allocate against it exactly like any ordinary invoice.
+    post_payment_in(
+        &mut w.conn, &w.company, &w.customer, &w.bank, "2026-04-01",
+        200_000_00, 0, &[Allocation { target_id: inv.clone(), amount_kobo: 200_000_00 }], None, &ctx,
+    ).unwrap();
+    let status: String = w.conn.query_row(
+        "SELECT status FROM invoices WHERE id = ?1", params![inv], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(status, "paid");
+}
+
+#[test]
+fn import_open_bill_posts_obe_and_ap_never_expense() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    let bill = import_open_bill(
+        &mut w.conn, &w.company, &w.supplier, Some("SUP-INV-42"), "2026-03-01", "2026-03-31",
+        "2026-03-01", 300_000_00, 300_000_00, false, None, &ctx,
+    ).unwrap();
+    let entry_id: String = w.conn.query_row(
+        "SELECT journal_entry_id FROM bills WHERE id = ?1", params![bill], |r| r.get(0),
+    ).unwrap();
+    let lines = entry_lines(&w.conn, &entry_id);
+    assert_eq!(lines.len(), 2);
+    assert!(lines.iter().any(|(acct,amt,_)| acct=="2100" && *amt==-300_000_00));
+    assert!(lines.iter().any(|(acct,amt,_)| acct=="3000" && *amt==300_000_00));
+    let status: String = w.conn.query_row(
+        "SELECT status FROM bills WHERE id = ?1", params![bill], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(status, "open");
+    assert_eq!(trial_balance(&w.conn), 0);
+}
+
+#[test]
+fn import_open_invoice_rejects_balance_exceeding_original_total() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    let err = import_open_invoice(
+        &mut w.conn, &w.company, &w.customer, "OLD-INV-002", "2026-03-01", "2026-03-15", "2026-03-01",
+        100_000_00, 150_000_00, &ctx,
+    );
+    assert!(err.is_err());
+}
+
+#[test]
+fn wizard_opening_line_detected_for_anti_double_count_guard() {
+    let mut w = world();
+    let ctx = PostCtx::default();
+    assert!(!has_wizard_opening_line(&w.conn, &w.company, &w.customer, "AR").unwrap());
+
+    // Simulate the wizard's lump entry: source_type='opening_balance', source_id NULL.
+    let ar: String = w.conn.query_row(
+        "SELECT id FROM accounts WHERE company_id = ?1 AND system_key = 'AR'", params![w.company], |r| r.get(0),
+    ).unwrap();
+    let obe: String = w.conn.query_row(
+        "SELECT id FROM accounts WHERE company_id = ?1 AND system_key = 'OPENING_BALANCE_EQUITY'", params![w.company], |r| r.get(0),
+    ).unwrap();
+    post_journal(
+        &mut w.conn, &w.company, "2026-01-01", "Opening balances at setup", "opening_balance", &ctx,
+        &[LineSpec::with_contact(&ar, 1_100_000_00, &w.customer), LineSpec::new(&obe, -1_100_000_00)],
+    ).unwrap();
+
+    assert!(has_wizard_opening_line(&w.conn, &w.company, &w.customer, "AR").unwrap());
+    // A DIFFERENT customer with no wizard line is unaffected.
+    assert!(!has_wizard_opening_line(&w.conn, &w.company, &w.supplier, "AR").unwrap());
 }

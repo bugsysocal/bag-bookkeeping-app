@@ -543,6 +543,480 @@ fn create_contact(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id:
     Ok(ContactDto { id, name, phone })
 }
 
+// ===== Contacts onboarding import (Spec 06 §3) =====
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ContactImportRowDto {
+    pub row_num: usize,
+    pub name: String,
+    pub kind: String,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub tin: Option<String>,
+    pub address: Option<String>,
+    pub terms_days: i64,
+    pub status: String, // "ready" | "warning" | "error"
+    pub message: Option<String>,
+}
+
+impl From<ledger_core::import_contacts::ContactImportRow> for ContactImportRowDto {
+    fn from(r: ledger_core::import_contacts::ContactImportRow) -> Self {
+        use ledger_core::import_contacts::RowStatus;
+        ContactImportRowDto {
+            row_num: r.row_num, name: r.name, kind: r.kind, phone: r.phone, email: r.email,
+            tin: r.tin, address: r.address, terms_days: r.terms_days,
+            status: match r.status {
+                RowStatus::Ready => "ready",
+                RowStatus::Warning => "warning",
+                RowStatus::Error => "error",
+            }
+            .into(),
+            message: r.message,
+        }
+    }
+}
+
+impl ContactImportRowDto {
+    fn into_engine(self) -> ledger_core::import_contacts::ContactImportRow {
+        use ledger_core::import_contacts::RowStatus;
+        ledger_core::import_contacts::ContactImportRow {
+            row_num: self.row_num, name: self.name, kind: self.kind, phone: self.phone,
+            email: self.email, tin: self.tin, address: self.address, terms_days: self.terms_days,
+            status: match self.status.as_str() {
+                "ready" => RowStatus::Ready,
+                "warning" => RowStatus::Warning,
+                _ => RowStatus::Error,
+            },
+            message: self.message,
+        }
+    }
+}
+
+fn parse_upload_err(e: String) -> CmdError {
+    CmdError {
+        code: "unreadable_file",
+        message: "That file couldn't be read. Make sure it's a .xlsx, .csv, or .txt file exported \
+                  from the Contacts template."
+            .into(),
+        detail: Some(e),
+    }
+}
+
+/// Stages 1–4 (parse/map/validate/preview) — writes nothing. `file_base64` is
+/// the raw file bytes, base64-encoded (the browser reads the file as an
+/// ArrayBuffer; xlsx and csv both travel the same way over IPC).
+#[tauri::command]
+fn import_contacts_preview(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String, file_base64: String,
+) -> Result<Vec<ContactImportRowDto>, CmdError> {
+    sess.0.require_session()?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(file_base64)
+        .map_err(|e| parse_upload_err(e.to_string()))?;
+    let rows = ledger_core::import_files::rows_from_upload(&filename, &bytes).map_err(parse_upload_err)?;
+    if rows.len() < 2 {
+        return Err(CmdError {
+            code: "empty_import",
+            message: "No contact rows found below the header row.".into(),
+            detail: None,
+        });
+    }
+    let conn = state.0.lock().unwrap();
+    let preview = ledger_core::import_contacts::preview_contacts(&conn, &company_id, &rows);
+    Ok(preview.into_iter().map(Into::into).collect())
+}
+
+#[derive(Serialize)]
+struct ContactImportResultDto {
+    rows_total: usize,
+    rows_ok: usize,
+    rows_error: usize,
+    exceptions: Vec<ContactImportRowDto>,
+}
+
+/// Stage 5 (Commit): takes back exactly the rows `import_contacts_preview`
+/// produced (the frontend doesn't re-validate) and writes the `ready` ones.
+#[tauri::command]
+fn import_contacts_commit(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String,
+    rows: Vec<ContactImportRowDto>,
+) -> Result<ContactImportResultDto, CmdError> {
+    let session = sess.0.require_session()?;
+    let mut conn = state.0.lock().unwrap();
+    let engine_rows = rows.into_iter().map(ContactImportRowDto::into_engine).collect();
+    let result = ledger_core::import_contacts::commit_contacts(
+        &mut conn, &company_id, &filename, engine_rows, Some(&session.user_id),
+    )?;
+    Ok(ContactImportResultDto {
+        rows_total: result.rows_total,
+        rows_ok: result.rows_ok,
+        rows_error: result.rows_error,
+        exceptions: result.exceptions.into_iter().map(Into::into).collect(),
+    })
+}
+
+// ===== Products (Spec 06 §3) =====
+
+#[derive(Serialize)]
+struct ProductDto {
+    id: String,
+    name: String,
+    kind: String,
+    sku: Option<String>,
+    sale_price_kobo: i64,
+    track_inventory: bool,
+}
+
+#[tauri::command]
+fn list_products(state: tauri::State<Db>, company_id: String) -> Result<Vec<ProductDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn
+        .prepare(
+            "SELECT id, name, kind, sku, sale_price_kobo, track_inventory FROM products
+             WHERE company_id = ?1 AND is_active = 1 ORDER BY name",
+        )
+        .map_err(db_err)?;
+    let rows = q
+        .query_map(rusqlite::params![company_id], |r| {
+            Ok(ProductDto {
+                id: r.get(0)?, name: r.get(1)?, kind: r.get(2)?, sku: r.get(3)?,
+                sale_price_kobo: r.get(4)?, track_inventory: r.get::<_, i64>(5)? != 0,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
+// ===== Products onboarding import (Spec 06 §3) =====
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProductImportRowDto {
+    pub row_num: usize,
+    pub name: String,
+    pub kind: String,
+    pub sku: Option<String>,
+    pub sale_price_kobo: i64,
+    pub is_vatable: bool,
+    pub qty_on_hand_milli: i64,
+    pub unit_cost_kobo: i64,
+    pub status: String, // "ready" | "warning" | "error"
+    pub message: Option<String>,
+}
+
+impl From<ledger_core::import_products::ProductImportRow> for ProductImportRowDto {
+    fn from(r: ledger_core::import_products::ProductImportRow) -> Self {
+        use ledger_core::import_products::RowStatus;
+        ProductImportRowDto {
+            row_num: r.row_num, name: r.name, kind: r.kind, sku: r.sku,
+            sale_price_kobo: r.sale_price_kobo, is_vatable: r.is_vatable,
+            qty_on_hand_milli: r.qty_on_hand_milli, unit_cost_kobo: r.unit_cost_kobo,
+            status: match r.status {
+                RowStatus::Ready => "ready",
+                RowStatus::Warning => "warning",
+                RowStatus::Error => "error",
+            }
+            .into(),
+            message: r.message,
+        }
+    }
+}
+
+impl ProductImportRowDto {
+    fn into_engine(self) -> ledger_core::import_products::ProductImportRow {
+        use ledger_core::import_products::RowStatus;
+        ledger_core::import_products::ProductImportRow {
+            row_num: self.row_num, name: self.name, kind: self.kind, sku: self.sku,
+            sale_price_kobo: self.sale_price_kobo, is_vatable: self.is_vatable,
+            qty_on_hand_milli: self.qty_on_hand_milli, unit_cost_kobo: self.unit_cost_kobo,
+            status: match self.status.as_str() {
+                "ready" => RowStatus::Ready,
+                "warning" => RowStatus::Warning,
+                _ => RowStatus::Error,
+            },
+            message: self.message,
+        }
+    }
+}
+
+fn company_inventory_enabled(conn: &Connection, company_id: &str) -> Result<bool, CmdError> {
+    let flag: i64 = conn
+        .query_row(
+            "SELECT inventory_enabled FROM companies WHERE id = ?1",
+            rusqlite::params![company_id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    Ok(flag != 0)
+}
+
+/// Stages 1–4 (parse/map/validate/preview) — writes nothing.
+#[tauri::command]
+fn import_products_preview(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String, file_base64: String,
+) -> Result<Vec<ProductImportRowDto>, CmdError> {
+    sess.0.require_session()?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(file_base64)
+        .map_err(|e| parse_upload_err(e.to_string()))?;
+    let rows = ledger_core::import_files::rows_from_upload(&filename, &bytes).map_err(parse_upload_err)?;
+    if rows.len() < 2 {
+        return Err(CmdError {
+            code: "empty_import",
+            message: "No product rows found below the header row.".into(),
+            detail: None,
+        });
+    }
+    let conn = state.0.lock().unwrap();
+    let inventory_enabled = company_inventory_enabled(&conn, &company_id)?;
+    let preview = ledger_core::import_products::preview_products(&conn, &company_id, inventory_enabled, &rows);
+    Ok(preview.into_iter().map(Into::into).collect())
+}
+
+#[derive(Serialize)]
+struct ProductImportResultDto {
+    rows_total: usize,
+    rows_ok: usize,
+    rows_error: usize,
+    exceptions: Vec<ProductImportRowDto>,
+}
+
+/// Stage 5 (Commit): takes back exactly the rows `import_products_preview`
+/// produced, writes the `ready` ones, and posts opening stock for
+/// inventory-tracked rows with a quantity on hand.
+#[tauri::command]
+fn import_products_commit(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String,
+    posting_date: String, rows: Vec<ProductImportRowDto>,
+) -> Result<ProductImportResultDto, CmdError> {
+    let session = sess.0.require_session()?;
+    let mut conn = state.0.lock().unwrap();
+    let inventory_enabled = company_inventory_enabled(&conn, &company_id)?;
+    let engine_rows = rows.into_iter().map(ProductImportRowDto::into_engine).collect();
+    let result = ledger_core::import_products::commit_products(
+        &mut conn, &company_id, &filename, &posting_date, inventory_enabled, engine_rows, Some(&session.user_id),
+    )?;
+    Ok(ProductImportResultDto {
+        rows_total: result.rows_total,
+        rows_ok: result.rows_ok,
+        rows_error: result.rows_error,
+        exceptions: result.exceptions.into_iter().map(Into::into).collect(),
+    })
+}
+
+// ===== Open Invoices / Open Bills onboarding import (Spec 06 §3/§3.1) =====
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct OpenInvoiceImportRowDto {
+    pub row_num: usize,
+    pub invoice_no: String,
+    pub customer_name: String,
+    pub issue_date: String,
+    pub due_date: String,
+    pub original_total_kobo: i64,
+    pub balance_outstanding_kobo: i64,
+    pub resolved_contact_id: Option<String>,
+    pub status: String, // "ready" | "warning" | "error"
+    pub message: Option<String>,
+}
+
+impl From<ledger_core::import_open_invoices::OpenInvoiceImportRow> for OpenInvoiceImportRowDto {
+    fn from(r: ledger_core::import_open_invoices::OpenInvoiceImportRow) -> Self {
+        use ledger_core::import_open_invoices::RowStatus;
+        OpenInvoiceImportRowDto {
+            row_num: r.row_num, invoice_no: r.invoice_no, customer_name: r.customer_name,
+            issue_date: r.issue_date, due_date: r.due_date,
+            original_total_kobo: r.original_total_kobo, balance_outstanding_kobo: r.balance_outstanding_kobo,
+            resolved_contact_id: r.resolved_contact_id,
+            status: match r.status {
+                RowStatus::Ready => "ready",
+                RowStatus::Warning => "warning",
+                RowStatus::Error => "error",
+            }
+            .into(),
+            message: r.message,
+        }
+    }
+}
+
+impl OpenInvoiceImportRowDto {
+    fn into_engine(self) -> ledger_core::import_open_invoices::OpenInvoiceImportRow {
+        use ledger_core::import_open_invoices::RowStatus;
+        ledger_core::import_open_invoices::OpenInvoiceImportRow {
+            row_num: self.row_num, invoice_no: self.invoice_no, customer_name: self.customer_name,
+            issue_date: self.issue_date, due_date: self.due_date,
+            original_total_kobo: self.original_total_kobo, balance_outstanding_kobo: self.balance_outstanding_kobo,
+            resolved_contact_id: self.resolved_contact_id,
+            status: match self.status.as_str() {
+                "ready" => RowStatus::Ready,
+                "warning" => RowStatus::Warning,
+                _ => RowStatus::Error,
+            },
+            message: self.message,
+        }
+    }
+}
+
+/// Stages 1–4 (parse/map/validate/preview) — writes nothing.
+#[tauri::command]
+fn import_open_invoices_preview(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String, file_base64: String,
+) -> Result<Vec<OpenInvoiceImportRowDto>, CmdError> {
+    sess.0.require_session()?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(file_base64)
+        .map_err(|e| parse_upload_err(e.to_string()))?;
+    let rows = ledger_core::import_files::rows_from_upload(&filename, &bytes).map_err(parse_upload_err)?;
+    if rows.len() < 2 {
+        return Err(CmdError {
+            code: "empty_import",
+            message: "No invoice rows found below the header row.".into(),
+            detail: None,
+        });
+    }
+    let conn = state.0.lock().unwrap();
+    let preview = ledger_core::import_open_invoices::preview_open_invoices(&conn, &company_id, &rows);
+    Ok(preview.into_iter().map(Into::into).collect())
+}
+
+#[derive(Serialize)]
+struct OpenInvoiceImportResultDto {
+    rows_total: usize,
+    rows_ok: usize,
+    rows_error: usize,
+    exceptions: Vec<OpenInvoiceImportRowDto>,
+}
+
+/// Stage 5 (Commit): takes back exactly the rows `import_open_invoices_preview`
+/// produced and posts each `ready`/`warning` row through `import_open_invoice`
+/// (Dr AR / Cr Opening Balance Equity, never revenue or VAT).
+#[tauri::command]
+fn import_open_invoices_commit(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String,
+    rows: Vec<OpenInvoiceImportRowDto>,
+) -> Result<OpenInvoiceImportResultDto, CmdError> {
+    let session = sess.0.require_session()?;
+    let mut conn = state.0.lock().unwrap();
+    let engine_rows = rows.into_iter().map(OpenInvoiceImportRowDto::into_engine).collect();
+    let result = ledger_core::import_open_invoices::commit_open_invoices(
+        &mut conn, &company_id, &filename, engine_rows, Some(&session.user_id),
+    )?;
+    Ok(OpenInvoiceImportResultDto {
+        rows_total: result.rows_total,
+        rows_ok: result.rows_ok,
+        rows_error: result.rows_error,
+        exceptions: result.exceptions.into_iter().map(Into::into).collect(),
+    })
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct OpenBillImportRowDto {
+    pub row_num: usize,
+    pub supplier_name: String,
+    pub reference: Option<String>,
+    pub bill_date: String,
+    pub due_date: String,
+    pub original_total_kobo: i64,
+    pub balance_outstanding_kobo: i64,
+    pub wht_applicable: bool,
+    pub wht_rate_bp: Option<i64>,
+    pub resolved_contact_id: Option<String>,
+    pub status: String, // "ready" | "warning" | "error"
+    pub message: Option<String>,
+}
+
+impl From<ledger_core::import_open_bills::OpenBillImportRow> for OpenBillImportRowDto {
+    fn from(r: ledger_core::import_open_bills::OpenBillImportRow) -> Self {
+        use ledger_core::import_open_bills::RowStatus;
+        OpenBillImportRowDto {
+            row_num: r.row_num, supplier_name: r.supplier_name, reference: r.reference,
+            bill_date: r.bill_date, due_date: r.due_date,
+            original_total_kobo: r.original_total_kobo, balance_outstanding_kobo: r.balance_outstanding_kobo,
+            wht_applicable: r.wht_applicable, wht_rate_bp: r.wht_rate_bp,
+            resolved_contact_id: r.resolved_contact_id,
+            status: match r.status {
+                RowStatus::Ready => "ready",
+                RowStatus::Warning => "warning",
+                RowStatus::Error => "error",
+            }
+            .into(),
+            message: r.message,
+        }
+    }
+}
+
+impl OpenBillImportRowDto {
+    fn into_engine(self) -> ledger_core::import_open_bills::OpenBillImportRow {
+        use ledger_core::import_open_bills::RowStatus;
+        ledger_core::import_open_bills::OpenBillImportRow {
+            row_num: self.row_num, supplier_name: self.supplier_name, reference: self.reference,
+            bill_date: self.bill_date, due_date: self.due_date,
+            original_total_kobo: self.original_total_kobo, balance_outstanding_kobo: self.balance_outstanding_kobo,
+            wht_applicable: self.wht_applicable, wht_rate_bp: self.wht_rate_bp,
+            resolved_contact_id: self.resolved_contact_id,
+            status: match self.status.as_str() {
+                "ready" => RowStatus::Ready,
+                "warning" => RowStatus::Warning,
+                _ => RowStatus::Error,
+            },
+            message: self.message,
+        }
+    }
+}
+
+#[tauri::command]
+fn import_open_bills_preview(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String, file_base64: String,
+) -> Result<Vec<OpenBillImportRowDto>, CmdError> {
+    sess.0.require_session()?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(file_base64)
+        .map_err(|e| parse_upload_err(e.to_string()))?;
+    let rows = ledger_core::import_files::rows_from_upload(&filename, &bytes).map_err(parse_upload_err)?;
+    if rows.len() < 2 {
+        return Err(CmdError {
+            code: "empty_import",
+            message: "No bill rows found below the header row.".into(),
+            detail: None,
+        });
+    }
+    let conn = state.0.lock().unwrap();
+    let preview = ledger_core::import_open_bills::preview_open_bills(&conn, &company_id, &rows);
+    Ok(preview.into_iter().map(Into::into).collect())
+}
+
+#[derive(Serialize)]
+struct OpenBillImportResultDto {
+    rows_total: usize,
+    rows_ok: usize,
+    rows_error: usize,
+    exceptions: Vec<OpenBillImportRowDto>,
+}
+
+#[tauri::command]
+fn import_open_bills_commit(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, filename: String,
+    rows: Vec<OpenBillImportRowDto>,
+) -> Result<OpenBillImportResultDto, CmdError> {
+    let session = sess.0.require_session()?;
+    let mut conn = state.0.lock().unwrap();
+    let engine_rows = rows.into_iter().map(OpenBillImportRowDto::into_engine).collect();
+    let result = ledger_core::import_open_bills::commit_open_bills(
+        &mut conn, &company_id, &filename, engine_rows, Some(&session.user_id),
+    )?;
+    Ok(OpenBillImportResultDto {
+        rows_total: result.rows_total,
+        rows_ok: result.rows_ok,
+        rows_error: result.rows_error,
+        exceptions: result.exceptions.into_iter().map(Into::into).collect(),
+    })
+}
+
 #[derive(Deserialize)]
 pub struct InvoiceLineDto {
     pub description: String,
@@ -1528,6 +2002,15 @@ pub fn run() {
             record_drawing,
             list_contacts,
             create_contact,
+            import_contacts_preview,
+            import_contacts_commit,
+            list_products,
+            import_products_preview,
+            import_products_commit,
+            import_open_invoices_preview,
+            import_open_invoices_commit,
+            import_open_bills_preview,
+            import_open_bills_commit,
             create_invoice_draft,
             send_invoice,
             list_invoices,

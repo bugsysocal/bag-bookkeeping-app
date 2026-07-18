@@ -94,7 +94,7 @@ fn cfg(conn: &Connection, company_id: &str) -> R<Cfg> {
 }
 
 /// Resolve a system account by key (engine never resolves by code — Spec 01 §5).
-fn sys(conn: &Connection, company_id: &str, key: &str) -> R<String> {
+pub(crate) fn sys(conn: &Connection, company_id: &str, key: &str) -> R<String> {
     conn.query_row(
         "SELECT id FROM accounts WHERE company_id = ?1 AND system_key = ?2 AND is_active = 1",
         params![company_id, key],
@@ -670,7 +670,13 @@ fn recompute_invoice_status(conn: &Connection, invoice_id: &str) -> R<()> {
         params![invoice_id],
         |r| r.get(0),
     )?;
-    let paid = allocated + deposit_applied;
+    // imported_paid_kobo: a pre-migration collection baseline with no payment_
+    // allocations row to back it (Spec 06 §3.1) — added to, never overwritten by,
+    // ordinary in-app activity.
+    let imported_paid: i64 = conn.query_row(
+        "SELECT imported_paid_kobo FROM invoices WHERE id = ?1", params![invoice_id], |r| r.get(0),
+    )?;
+    let paid = allocated + deposit_applied + imported_paid;
     conn.execute(
         "UPDATE invoices SET amount_paid_kobo = ?2,
            status = CASE
@@ -685,13 +691,19 @@ fn recompute_invoice_status(conn: &Connection, invoice_id: &str) -> R<()> {
 }
 
 fn recompute_bill_status(conn: &Connection, bill_id: &str) -> R<()> {
-    let paid: i64 = conn.query_row(
+    let allocated: i64 = conn.query_row(
         "SELECT COALESCE(SUM(pa.amount_kobo), 0) FROM payment_allocations pa
          JOIN payments p ON p.id = pa.payment_id
          WHERE pa.target_type = 'bill' AND pa.target_id = ?1 AND p.voided = 0",
         params![bill_id],
         |r| r.get(0),
     )?;
+    // Same pre-migration baseline as invoices (Spec 06 §3.1) — added to, never
+    // overwritten by, ordinary in-app payment activity.
+    let imported_paid: i64 = conn.query_row(
+        "SELECT imported_paid_kobo FROM bills WHERE id = ?1", params![bill_id], |r| r.get(0),
+    )?;
+    let paid = allocated + imported_paid;
     conn.execute(
         "UPDATE bills SET amount_paid_kobo = ?2,
            status = CASE
@@ -1219,6 +1231,162 @@ pub fn refund_deposit(
     )?;
     tx.commit()?;
     Ok(PaymentResult { payment_id, entry_id, receipt_number: None, wht_kobo: 0, deposit_kobo: -amount_kobo })
+}
+
+// ===== Historical open-document import (Spec 06 §3.1) =====
+// Migrating a real invoice/bill from a prior system is NOT the same event as
+// creating one today: the revenue/cost was already earned and (presumably)
+// already filed with FIRS under the old system. Re-crediting Revenue or
+// VAT_OUTPUT here would restate already-filed income and create a phantom
+// VAT liability. So these two functions post ONLY the outstanding balance,
+// Dr AR / Cr Opening Balance Equity (or the mirror for bills) — never
+// Revenue, never VAT — exactly like the wizard's lump opening-balance entry,
+// just per-document instead of per-contact, dated on the document's own
+// issue/bill date so each migrated document keeps its real history.
+
+/// Historical open invoice import. `posting_date` is normally `issue_date`,
+/// but the caller may supply a different "opening balance date" when
+/// `issue_date` falls in a hard-closed period (Spec 06 §3.1 — "dated the
+/// invoice's issue date, or the opening-balance date if the period is
+/// locked"); the invoice's own `issue_date` field is unaffected either way,
+/// so aging and the customer's statement still read correctly.
+#[allow(clippy::too_many_arguments)]
+pub fn import_open_invoice(
+    conn: &mut Connection,
+    company_id: &str,
+    contact_id: &str,
+    invoice_no: &str,
+    issue_date: &str,
+    due_date: &str,
+    posting_date: &str,
+    original_total_kobo: i64,
+    balance_outstanding_kobo: i64,
+    ctx: &PostCtx,
+) -> R<String> {
+    if original_total_kobo <= 0 {
+        return Err(EngineError::Validation("the original total must be positive".into()));
+    }
+    if balance_outstanding_kobo <= 0 || balance_outstanding_kobo > original_total_kobo {
+        return Err(EngineError::Validation(
+            "the balance outstanding must be positive and not more than the original total".into(),
+        ));
+    }
+    let c = cfg(conn, company_id)?;
+    check_soft_close(&c, posting_date, ctx)?;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Carries the prior system's own invoice number forward (Spec 06 §3: "invoice
+    // no.*" is a required import field and the dedup key) rather than drawing a
+    // new one from `document_sequences` — an imported invoice keeps its history's
+    // identity, and the importer checks for a clash against it before calling here.
+    let number = invoice_no.to_string();
+    let paid = original_total_kobo - balance_outstanding_kobo;
+    let status = if paid > 0 { "partially_paid" } else { "sent" };
+    let invoice_id = new_id();
+    let now = now_iso();
+    tx.execute(
+        "INSERT INTO invoices (id, company_id, contact_id, number, kind, status, issue_date, due_date,
+                               currency, subtotal_kobo, vat_kobo, total_kobo, amount_paid_kobo,
+                               imported_paid_kobo, created_by, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'invoice', ?5, ?6, ?7, 'NGN', ?8, 0, ?8, ?9, ?9, ?10, ?11)",
+        // subtotal = original total, vat = 0: a migrated invoice's VAT split from the
+        // prior system is neither known nor relevant here — it never touches VAT_OUTPUT.
+        // imported_paid_kobo = amount_paid_kobo initially; recompute_invoice_status
+        // will keep adding it back in forever after (never overwritten).
+        params![invoice_id, company_id, contact_id, number, status, issue_date, due_date,
+                original_total_kobo, paid, ctx.user_id, now],
+    )?;
+
+    let ar = sys(&tx, company_id, "AR")?;
+    let obe = sys(&tx, company_id, "OPENING_BALANCE_EQUITY")?;
+    let entry_id = post_entry_in(
+        &tx, company_id, posting_date, &format!("Opening balance — invoice {number} (imported)"),
+        "opening_balance", Some(&invoice_id), ctx.user_id.as_deref(),
+        &[
+            LineSpec::with_contact(&ar, balance_outstanding_kobo, contact_id),
+            LineSpec::new(&obe, -balance_outstanding_kobo),
+        ],
+    ).map_err(EngineError::from)?;
+    tx.execute("UPDATE invoices SET journal_entry_id = ?2 WHERE id = ?1", params![invoice_id, entry_id])?;
+    tx.commit()?;
+    Ok(invoice_id)
+}
+
+/// Mirror of `import_open_invoice` for the payables side: Dr Opening Balance
+/// Equity / Cr AP — never an expense/COGS account, for the same reason.
+#[allow(clippy::too_many_arguments)]
+pub fn import_open_bill(
+    conn: &mut Connection,
+    company_id: &str,
+    contact_id: &str,
+    reference: Option<&str>,
+    bill_date: &str,
+    due_date: &str,
+    posting_date: &str,
+    original_total_kobo: i64,
+    balance_outstanding_kobo: i64,
+    wht_applicable: bool,
+    wht_rate_bp: Option<i64>,
+    ctx: &PostCtx,
+) -> R<String> {
+    if original_total_kobo <= 0 {
+        return Err(EngineError::Validation("the original total must be positive".into()));
+    }
+    if balance_outstanding_kobo <= 0 || balance_outstanding_kobo > original_total_kobo {
+        return Err(EngineError::Validation(
+            "the balance outstanding must be positive and not more than the original total".into(),
+        ));
+    }
+    let c = cfg(conn, company_id)?;
+    check_soft_close(&c, posting_date, ctx)?;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let paid = original_total_kobo - balance_outstanding_kobo;
+    let status = if paid > 0 { "partially_paid" } else { "open" };
+    let bill_id = new_id();
+    let now = now_iso();
+    tx.execute(
+        "INSERT INTO bills (id, company_id, contact_id, reference, status, bill_date, due_date,
+                            currency, subtotal_kobo, vat_kobo, total_kobo, wht_applicable, wht_rate_bp,
+                            amount_paid_kobo, imported_paid_kobo, created_by, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'NGN', ?8, 0, ?8, ?9, ?10, ?11, ?11, ?12, ?13)",
+        params![bill_id, company_id, contact_id, reference, status, bill_date, due_date,
+                original_total_kobo, wht_applicable as i64, wht_rate_bp, paid, ctx.user_id, now],
+    )?;
+
+    let ap = sys(&tx, company_id, "AP")?;
+    let obe = sys(&tx, company_id, "OPENING_BALANCE_EQUITY")?;
+    let entry_id = post_entry_in(
+        &tx, company_id, posting_date,
+        &format!("Opening balance — bill {} (imported)", reference.unwrap_or("no ref")),
+        "opening_balance", Some(&bill_id), ctx.user_id.as_deref(),
+        &[
+            LineSpec::new(&obe, balance_outstanding_kobo),
+            LineSpec::with_contact(&ap, -balance_outstanding_kobo, contact_id),
+        ],
+    ).map_err(EngineError::from)?;
+    tx.execute("UPDATE bills SET journal_entry_id = ?2 WHERE id = ?1", params![bill_id, entry_id])?;
+    tx.commit()?;
+    Ok(bill_id)
+}
+
+/// Has this contact already received a lump-sum opening AR/AP line from the
+/// setup wizard? Spec 06 §3.1's anti-double-count guard: detailed invoice/
+/// bill import and the wizard's lump entry are mutually exclusive per
+/// contact — the wizard's lines are `source_type='opening_balance'` with no
+/// `source_id` (not linked to any invoice/bill row), which is exactly what
+/// distinguishes them from imported per-document opening lines.
+pub fn has_wizard_opening_line(conn: &Connection, company_id: &str, contact_id: &str, system_key: &str) -> R<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM journal_lines l
+         JOIN journal_entries e ON e.id = l.entry_id
+         JOIN accounts a ON a.id = l.account_id
+         WHERE e.company_id = ?1 AND e.is_posted = 1 AND e.source_type = 'opening_balance'
+           AND e.source_id IS NULL AND l.contact_id = ?2 AND a.system_key = ?3",
+        params![company_id, contact_id, system_key],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 // ===== Reversal (Spec 01 §6.8) =====

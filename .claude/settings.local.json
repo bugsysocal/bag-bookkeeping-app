@@ -27,7 +27,12 @@
       "PowerShell(Get-Process ledgerone-desktop -ErrorAction SilentlyContinue)",
       "PowerShell(Rename-Item \"$env:APPDATA\\\\ng.boltonadvisory.ledgerone\\\\ledgerone.db\" \"ledgerone.scratch-$\\(Get-Date -Format HHmmss\\).db.bak\"; Remove-Item \"$env:APPDATA\\\\ng.boltonadvisory.ledgerone\\\\ledgerone.db-shm\",\"$env:APPDATA\\\\ng.boltonadvisory.ledgerone\\\\ledgerone.db-wal\" -Force -Confirm:$false -ErrorAction SilentlyContinue; Start-Process \"C:\\\\Users\\\\Boyega\\\\Documents\\\\Claude Code\\\\Book Keeping App\\\\target\\\\debug\\\\ledgerone-desktop.exe\"; Start-Sleep -Seconds 3; \"instances: $\\(\\(Get-Process ledgerone-desktop -ErrorAction SilentlyContinue | Measure-Object\\).Count\\)\")",
       "PowerShell($p = Get-Process ledgerone-desktop | Select-Object -First 1; [void][W]::SetForegroundWindow\\($p.MainWindowHandle\\); \"front\")",
-      "PowerShell(Start-Sleep -Seconds 6; \"instances: $\\(\\(Get-Process ledgerone-desktop -ErrorAction SilentlyContinue | Measure-Object\\).Count\\)\"; Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\b3j9nxcce.output\" -ErrorAction SilentlyContinue -Tail 15)"
+      "PowerShell(Start-Sleep -Seconds 6; \"instances: $\\(\\(Get-Process ledgerone-desktop -ErrorAction SilentlyContinue | Measure-Object\\).Count\\)\"; Get-Content \"C:\\\\Users\\\\Boyega\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-Boyega-Documents-Claude-Code-Book-Keeping-App\\\\01b963be-3a62-4f2d-8c67-b4a63db493ff\\\\tasks\\\\b3j9nxcce.output\" -ErrorAction SilentlyContinue -Tail 15)",
+      "Bash(grep -rn \"pub enum Data\" \"/c/Users/Boyega/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/calamine-0.26.1/src/\" )",
+      "Bash(awk '/pub fn import_open_invoice/,/^}/' crates/ledger-core/src/engine.rs)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(tasklist)"
     ]
   }
 }

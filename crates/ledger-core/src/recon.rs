@@ -5,6 +5,7 @@
 //! flagged. The quarantine lives on the statement line, visibly, and carries
 //! forward across sessions so it cannot age out of sight.
 
+use crate::csv_util::split_csv_line;
 use crate::engine::{EngineError, PostCtx};
 use crate::ids::{new_id, now_iso};
 use crate::posting::{post_entry_in, LineSpec};
@@ -39,23 +40,6 @@ pub struct StmtRow {
 
 /// Minimal quoted-field CSV splitter — Nigerian bank exports are simple, but
 /// descriptions do contain commas inside quotes.
-fn split_csv_line(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_q = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' if in_q && chars.peek() == Some(&'"') => { cur.push('"'); chars.next(); }
-            '"' => in_q = !in_q,
-            ',' if !in_q => { out.push(cur.trim().to_string()); cur = String::new(); }
-            _ => cur.push(c),
-        }
-    }
-    out.push(cur.trim().to_string());
-    out
-}
-
 fn parse_date(raw: &str, fmt: &str) -> Option<String> {
     let seps: &[char] = &['/', '-', '.', ' '];
     let parts: Vec<&str> = raw.trim().split(seps).filter(|p| !p.is_empty()).collect();
