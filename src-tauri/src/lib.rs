@@ -2027,6 +2027,137 @@ fn contact_statement(state: tauri::State<Db>, company_id: String, contact_id: St
     })
 }
 
+// ===== `.xlsx` export of Spec 05 reports (Spec 06 §5) =====
+// Each command re-runs the same ledger_core::reports query the on-screen
+// version uses (Spec 05 §7's "no schema, no engine surface" holds here too —
+// export is a rendering choice, not a new data path) and pipes it through
+// export_xlsx. Returns base64; the UI turns that into a Blob download, same
+// mechanism as the importers' exceptions-CSV download.
+
+use ledger_core::export_xlsx::{self, ExportHeader};
+
+fn xlsx_base64(bytes: Result<Vec<u8>, String>) -> Result<String, CmdError> {
+    use base64::Engine;
+    let bytes = bytes.map_err(|e| CmdError {
+        code: "export_failed",
+        message: "Couldn't build the export file. Nothing on your books was changed.".into(),
+        detail: Some(e),
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+#[tauri::command]
+fn export_aging_receivables_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, as_of: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let rows = reports::aging_receivables(&conn, &company_id, &as_of)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Aging Receivables", period_label: &format!("As of {as_of}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_aging(&header, &rows))
+}
+
+#[tauri::command]
+fn export_aging_payables_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, as_of: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let rows = reports::aging_payables(&conn, &company_id, &as_of)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Aging Payables", period_label: &format!("As of {as_of}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_aging(&header, &rows))
+}
+
+#[tauri::command]
+fn export_sales_by_customer_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, start: String, end: String, top_n: usize) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let rows = reports::sales_by_customer(&conn, &company_id, &start, &end, top_n)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Sales by Customer", period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_sales(&header, &rows))
+}
+
+#[tauri::command]
+fn export_sales_by_product_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, start: String, end: String, top_n: usize) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let rows = reports::sales_by_product(&conn, &company_id, &start, &end, top_n)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Sales by Product", period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_sales(&header, &rows))
+}
+
+#[tauri::command]
+fn export_income_statement_accrual_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, start: String, end: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let stmt = reports::income_statement_accrual(&conn, &company_id, &start, &end)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Income Statement (Accrual)", period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_income_statement_accrual(&header, &stmt))
+}
+
+#[tauri::command]
+fn export_income_statement_cash_basis_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, start: String, end: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let stmt = reports::income_statement_cash_basis(&conn, &company_id, &start, &end)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Income Statement (Cash Basis)", period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_income_statement_cash_basis(&header, &stmt))
+}
+
+#[tauri::command]
+fn export_balance_sheet_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, as_of: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let bs = reports::balance_sheet(&conn, &company_id, &as_of)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Balance Sheet", period_label: &format!("As of {as_of}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_balance_sheet(&header, &bs))
+}
+
+#[tauri::command]
+fn export_cash_flow_statement_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, start: String, end: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let cf = reports::cash_flow_statement(&conn, &company_id, &start, &end)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Cash Flow Statement", period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_cash_flow_statement(&header, &cf))
+}
+
+#[tauri::command]
+fn export_trial_balance_xlsx(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, company_name: String, as_of: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    let rows = reports::trial_balance(&conn, &company_id, &as_of)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "Trial Balance", period_label: &format!("As of {as_of}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_trial_balance(&header, &rows))
+}
+
+#[tauri::command]
+fn export_general_ledger_xlsx(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, account_id: String, company_id: String, company_name: String,
+    account_name: String, start: String, end: String, contact_id: Option<String>,
+) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    let gl = reports::general_ledger(&conn, &company_id, &account_id, &start, &end, contact_id.as_deref())?;
+    let header = ExportHeader { company_name: &company_name, report_title: &format!("General Ledger — {account_name}"), period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_general_ledger(&header, &gl))
+}
+
+#[tauri::command]
+fn export_vat_report_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, month_start: String, month_end: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let range = reports::PeriodRange { start: month_start.clone(), end: month_end.clone() };
+    let vr = reports::vat_report(&conn, &company_id, &range)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "VAT Report", period_label: &format!("{month_start} to {month_end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_vat_report(&header, &vr))
+}
+
+#[tauri::command]
+fn export_wht_remittance_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, start: String, end: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let range = reports::PeriodRange { start: start.clone(), end: end.clone() };
+    let rows = reports::wht_remittance_schedule(&conn, &company_id, &range)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "WHT Remittance Schedule", period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_wht_remittance(&header, &rows))
+}
+
+#[tauri::command]
+fn export_wht_credit_xlsx(state: tauri::State<Db>, company_id: String, company_name: String, start: String, end: String) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let range = reports::PeriodRange { start: start.clone(), end: end.clone() };
+    let rows = reports::wht_credit_schedule(&conn, &company_id, &range)?;
+    let header = ExportHeader { company_name: &company_name, report_title: "WHT Credit Schedule", period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso() };
+    xlsx_base64(export_xlsx::export_wht_credit(&header, &rows))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -2114,7 +2245,20 @@ pub fn run() {
             wht_remittance_schedule,
             wht_credit_schedule,
             wht_cumulative_credit,
-            contact_statement
+            contact_statement,
+            export_aging_receivables_xlsx,
+            export_aging_payables_xlsx,
+            export_sales_by_customer_xlsx,
+            export_sales_by_product_xlsx,
+            export_income_statement_accrual_xlsx,
+            export_income_statement_cash_basis_xlsx,
+            export_balance_sheet_xlsx,
+            export_cash_flow_statement_xlsx,
+            export_trial_balance_xlsx,
+            export_general_ledger_xlsx,
+            export_vat_report_xlsx,
+            export_wht_remittance_xlsx,
+            export_wht_credit_xlsx
         ])
         .run(tauri::generate_context!())
         .expect("error while running LedgerOne");

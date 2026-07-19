@@ -11,6 +11,7 @@ pub mod auth;
 pub mod csv_util;
 pub mod db;
 pub mod engine;
+pub mod export_xlsx;
 pub mod import_contacts;
 pub mod import_files;
 pub mod import_open_bills;

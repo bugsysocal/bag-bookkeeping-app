@@ -1270,6 +1270,29 @@ function downloadCsv(filename, rows){
   URL.revokeObjectURL(a.href);
 }
 
+// Spec 06 §5: report exports come back from Rust as base64 xlsx bytes —
+// same download-via-Blob mechanism as the CSV exceptions files above.
+function downloadXlsxBase64(filename, base64){
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], {type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function exportReportXlsx(btnId, filename, command, args){
+  const btn = el(btnId);
+  const original = btn.textContent;
+  btn.disabled = true; btn.textContent = "Exporting…";
+  try {
+    const b64 = await invoke(command, args);
+    downloadXlsxBase64(filename, b64);
+  } catch(e){ err(e); }
+  finally { btn.disabled = false; btn.textContent = original; }
+}
+
 const CONTACT_ROW_CHIP = { ready:["paid","Ready"], warning:["partially_paid","Warning"], error:["overdue","Error"] };
 
 async function viewContacts(){
@@ -1474,11 +1497,16 @@ async function renderOwnerReports(){
       ${rows.map(r=>`<tr><td>${esc(r.label)}</td><td>${(r.qty_milli/1000).toLocaleString()}</td><td>${naira(r.value_kobo)}</td></tr>`).join("")}
     </table>` : `<div class="mut">No sales yet this month.</div>`;
   box.innerHTML = `
-    <h3>Who owes me</h3>${agingTable(ar,"Customer")}
-    <h3 style="margin-top:22px">Who I owe</h3>${agingTable(ap,"Supplier")}
-    <h3 style="margin-top:22px">Top customers this month</h3>${salesTable(salesC)}
-    <h3 style="margin-top:22px">Top products this month</h3>${salesTable(salesP)}
+    <h3>Who owes me <button class="ghost" id="exp-ar" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>${agingTable(ar,"Customer")}
+    <h3 style="margin-top:22px">Who I owe <button class="ghost" id="exp-ap" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>${agingTable(ap,"Supplier")}
+    <h3 style="margin-top:22px">Top customers this month <button class="ghost" id="exp-salesc" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>${salesTable(salesC)}
+    <h3 style="margin-top:22px">Top products this month <button class="ghost" id="exp-salesp" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>${salesTable(salesP)}
     ${drawings>0?`<div class="ok" style="margin-top:16px">You took out ${naira(drawings)} this month <span class="mut">(not a business cost)</span></div>`:""}`;
+
+  el("exp-ar").onclick = () => exportReportXlsx("exp-ar", `Aging Receivables ${today()}.xlsx`, "export_aging_receivables_xlsx", {companyId:CO.id, companyName:CO.name, asOf:today()});
+  el("exp-ap").onclick = () => exportReportXlsx("exp-ap", `Aging Payables ${today()}.xlsx`, "export_aging_payables_xlsx", {companyId:CO.id, companyName:CO.name, asOf:today()});
+  el("exp-salesc").onclick = () => exportReportXlsx("exp-salesc", `Sales by Customer ${p.start} to ${p.end}.xlsx`, "export_sales_by_customer_xlsx", {companyId:CO.id, companyName:CO.name, start:p.start, end:p.end, topN:5});
+  el("exp-salesp").onclick = () => exportReportXlsx("exp-salesp", `Sales by Product ${p.start} to ${p.end}.xlsx`, "export_sales_by_product_xlsx", {companyId:CO.id, companyName:CO.name, start:p.start, end:p.end, topN:5});
 }
 
 // ── Formal statements: Income Statement (accrual/cash toggle), Balance Sheet, Cash Flow (§4) ──
@@ -1513,11 +1541,11 @@ async function paintStatements(){
   ]);
   const acctRows = rows => rows.map(a=>`<tr class="indent"><td>${esc(a.name)}</td><td>${naira(a.amount_kobo)}</td></tr>`).join("");
   const incomeHtml = STMT_CASH ? `
-    <h3>Profit &amp; Loss — Cash basis</h3><div class="mut">${esc(cb.caption)}</div>
+    <h3>Profit &amp; Loss — Cash basis <button class="ghost" id="exp-is" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3><div class="mut">${esc(cb.caption)}</div>
     <table><tr><td>Money in (collected)</td><td>${naira(cb.revenue_kobo)}</td></tr>
       <tr><td>Money out (paid)</td><td>${naira(cb.expense_kobo)}</td></tr>
       <tr class="stmttotal"><td>Net profit</td><td>${naira(cb.net_profit_kobo)}</td></tr></table>`
-    : `<h3>Income Statement — Accrual</h3>
+    : `<h3>Income Statement — Accrual <button class="ghost" id="exp-is" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>
     <table>
       <tr class="stmtsection"><td>Revenue</td><td></td></tr>${acctRows(is.revenue)}
       <tr class="indent" style="font-weight:600"><td>Total revenue</td><td>${naira(is.revenue_total_kobo)}</td></tr>
@@ -1530,7 +1558,7 @@ async function paintStatements(){
       ${is.non_operating_kobo!==0?`<tr><td>Exchange gain/(loss)</td><td>${naira(is.non_operating_kobo)}</td></tr>`:""}
       <tr class="stmttotal"><td>Net profit</td><td>${naira(is.net_profit_kobo)}</td></tr>
     </table>`;
-  const bsHtml = `<h3 style="margin-top:26px">Balance Sheet — as of ${dmy(p.end)}</h3>
+  const bsHtml = `<h3 style="margin-top:26px">Balance Sheet — as of ${dmy(p.end)} <button class="ghost" id="exp-bs" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>
     <table>
       <tr class="stmtsection"><td>Assets</td><td></td></tr>
       <tr class="indent"><td>Cash &amp; Bank</td><td>${naira(bs.cash_and_bank_kobo)}</td></tr>
@@ -1553,7 +1581,7 @@ async function paintStatements(){
       <tr class="stmttotal"><td>Total equity</td><td>${naira(bs.total_equity_kobo)}</td></tr>
     </table>
     <div class="${bs.ties?"tie-ok":"tie-bad"}" style="margin-top:6px">${bs.ties?"✓ Balanced":"✗ NOT BALANCED — tell your advisor"}</div>`;
-  const cfHtml = `<h3 style="margin-top:26px">Cash Flow</h3>
+  const cfHtml = `<h3 style="margin-top:26px">Cash Flow <button class="ghost" id="exp-cf" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>
     <table>
       <tr><td>From running the business</td><td>${naira(cf.operating_kobo)}</td></tr>
       <tr><td>From buying/selling equipment</td><td>${naira(cf.investing_kobo)}</td></tr>
@@ -1563,6 +1591,12 @@ async function paintStatements(){
       <tr><td>Cash at end</td><td>${naira(cf.closing_cash_kobo)}</td></tr>
     </table>`;
   body.innerHTML = incomeHtml + bsHtml + cfHtml;
+
+  el("exp-is").onclick = () => STMT_CASH
+    ? exportReportXlsx("exp-is", `Income Statement (Cash) ${p.start} to ${p.end}.xlsx`, "export_income_statement_cash_basis_xlsx", {companyId:CO.id, companyName:CO.name, start:p.start, end:p.end})
+    : exportReportXlsx("exp-is", `Income Statement (Accrual) ${p.start} to ${p.end}.xlsx`, "export_income_statement_accrual_xlsx", {companyId:CO.id, companyName:CO.name, start:p.start, end:p.end});
+  el("exp-bs").onclick = () => exportReportXlsx("exp-bs", `Balance Sheet ${p.end}.xlsx`, "export_balance_sheet_xlsx", {companyId:CO.id, companyName:CO.name, asOf:p.end});
+  el("exp-cf").onclick = () => exportReportXlsx("exp-cf", `Cash Flow ${p.start} to ${p.end}.xlsx`, "export_cash_flow_statement_xlsx", {companyId:CO.id, companyName:CO.name, start:p.start, end:p.end});
 }
 
 // ── Tax reports: VAT (calendar-monthly, Spec 05 §5.1) + WHT schedules (§5.2) ──
@@ -1591,7 +1625,7 @@ async function paintTax(){
     invoke("wht_cumulative_credit",{companyId:CO.id, asOf:monthEnd}),
   ]);
   body.innerHTML = `
-    <h3>VAT — due by the 21st of next month</h3>
+    <h3>VAT — due by the 21st of next month <button class="ghost" id="exp-vat" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>
     <table><tr><th>Document</th><th>Party</th><th>TIN</th><th>Net</th><th>VAT</th></tr>
       <tr class="stmtsection"><td colspan="5">Tax collected on sales</td></tr>
       ${vat.output.map(l=>`<tr><td>${esc(l.doc_number)}</td><td>${esc(l.party_name)}</td><td>${esc(l.tin||"")}</td><td>${naira(l.net_kobo)}</td><td>${naira(l.vat_kobo)}</td></tr>`).join("")}
@@ -1603,15 +1637,19 @@ async function paintTax(){
       ${vat.credit_brought_forward_kobo>0?`<tr><td colspan="4">Credit from before</td><td>${naira(vat.credit_brought_forward_kobo)}</td></tr>`:""}
       <tr class="stmttotal"><td colspan="4">Amount to pay FIRS</td><td>${naira(Math.max(0,vat.net_due_kobo))}</td></tr>
     </table>
-    <h3 style="margin-top:22px">Tax held back from suppliers (to remit)</h3>
+    <h3 style="margin-top:22px">Tax held back from suppliers (to remit) <button class="ghost" id="exp-whtr" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>
     ${remit.length?`<table><tr><th>Date</th><th>Supplier</th><th>TIN</th><th>Bill</th><th>Base</th><th>Tax held</th></tr>
       ${remit.map(l=>`<tr><td>${dmy(l.payment_date)}</td><td>${esc(l.supplier_name)}</td><td>${esc(l.tin||"")}</td><td>${esc(l.bill_ref||"")}</td><td>${naira(l.base_kobo)}</td><td>${naira(l.wht_kobo)}</td></tr>`).join("")}
       </table>`:`<div class="mut">None this month.</div>`}
-    <h3 style="margin-top:22px">Tax customers held back from us</h3>
+    <h3 style="margin-top:22px">Tax customers held back from us <button class="ghost" id="exp-whtc" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>
     ${credit.length?`<table><tr><th>Date</th><th>Customer</th><th>TIN</th><th>Base</th><th>Tax held</th></tr>
       ${credit.map(l=>`<tr><td>${dmy(l.receipt_date)}</td><td>${esc(l.customer_name)}</td><td>${esc(l.tin||"")}</td><td>${naira(l.base_kobo)}</td><td>${naira(l.wht_kobo)}</td></tr>`).join("")}
       </table>`:`<div class="mut">None this month.</div>`}
     <div class="ok" style="margin-top:12px">Total tax credit available so far: ${naira(cumCredit)} <span class="mut">(can offset company income tax)</span></div>`;
+
+  el("exp-vat").onclick = () => exportReportXlsx("exp-vat", `VAT Report ${monthStart} to ${monthEnd}.xlsx`, "export_vat_report_xlsx", {companyId:CO.id, companyName:CO.name, monthStart, monthEnd});
+  el("exp-whtr").onclick = () => exportReportXlsx("exp-whtr", `WHT Remittance ${monthStart} to ${monthEnd}.xlsx`, "export_wht_remittance_xlsx", {companyId:CO.id, companyName:CO.name, start:monthStart, end:monthEnd});
+  el("exp-whtc").onclick = () => exportReportXlsx("exp-whtc", `WHT Credit ${monthStart} to ${monthEnd}.xlsx`, "export_wht_credit_xlsx", {companyId:CO.id, companyName:CO.name, start:monthStart, end:monthEnd});
 }
 
 // ── Advisor tier: Trial Balance + General Ledger (§4.5) — the first real
@@ -1634,7 +1672,7 @@ async function renderAdvisorReports(){
     const shown = tb.filter(r => r.debit_kobo !== 0 || r.credit_kobo !== 0);
     const totalDr = shown.reduce((t,r)=>t+r.debit_kobo,0), totalCr = shown.reduce((t,r)=>t+r.credit_kobo,0);
     box.innerHTML = `
-      <h3>Trial Balance — as of ${dmy(asOf)}</h3>
+      <h3>Trial Balance — as of ${dmy(asOf)} <button class="ghost" id="exp-tb" style="margin-left:8px;font-size:12px;padding:2px 10px">Export .xlsx</button></h3>
       <table><tr><th>Code</th><th>Account</th><th>Debit</th><th>Credit</th></tr>
         ${shown.map(r=>`<tr><td>${esc(r.code)}</td><td>${esc(r.name)}</td><td>${r.debit_kobo?naira(r.debit_kobo):""}</td><td>${r.credit_kobo?naira(r.credit_kobo):""}</td></tr>`).join("")}
         <tr class="stmttotal"><td colspan="2">Total</td><td>${naira(totalDr)}</td><td>${naira(totalCr)}</td></tr>
@@ -1647,15 +1685,22 @@ async function renderAdvisorReports(){
         <div style="display:flex;align-items:flex-end"><button class="ghost" id="gl-go" style="width:100%">Show</button></div>
       </div>
       <div id="glbody"></div>`;
+    el("exp-tb").onclick = () => exportReportXlsx("exp-tb", `Trial Balance ${asOf}.xlsx`, "export_trial_balance_xlsx", {companyId:CO.id, companyName:CO.name, asOf});
     el("gl-go").onclick = async () => {
       try {
-        const gl = await invoke("general_ledger",{accountId:el("gl-acct").value, companyId:CO.id,
-          start:el("gl-from").value, end:el("gl-to").value, contactId:null});
+        const acctId = el("gl-acct").value, start = el("gl-from").value, end = el("gl-to").value;
+        const gl = await invoke("general_ledger",{accountId:acctId, companyId:CO.id, start, end, contactId:null});
         el("glbody").innerHTML = `<table><tr><th>Date</th><th>Memo</th><th>Who</th><th>Amount</th><th>Balance</th></tr>
           <tr><td colspan="4">Opening balance</td><td>${naira(gl.opening_balance_kobo)}</td></tr>
           ${gl.lines.map(l=>`<tr><td>${dmy(l.date)}</td><td>${esc(l.memo)}</td><td>${esc(l.contact_name||"")}</td><td>${naira(l.amount_kobo)}</td><td>${naira(l.running_balance_kobo)}</td></tr>`).join("")}
           <tr class="stmttotal"><td colspan="4">Closing balance</td><td>${naira(gl.closing_balance_kobo)}</td></tr>
-        </table>`;
+        </table>
+        <button class="ghost" id="exp-gl" style="margin-top:8px">Export .xlsx</button>`;
+        el("exp-gl").onclick = () => {
+          const acctName = el("gl-acct").selectedOptions[0].textContent;
+          return exportReportXlsx("exp-gl", `General Ledger — ${acctName} ${start} to ${end}.xlsx`, "export_general_ledger_xlsx",
+            {accountId:acctId, companyId:CO.id, companyName:CO.name, accountName:acctName, start, end, contactId:null});
+        };
       } catch(e){ err(e); }
     };
   } catch(e){ err(e); }
