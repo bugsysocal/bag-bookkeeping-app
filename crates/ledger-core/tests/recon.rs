@@ -248,3 +248,59 @@ fn above_limit_line_resolves_via_manual_journal_and_ordinary_match_not_a_bypass(
     assert_eq!(state, "matched");
     assert_eq!(complete(&mut w.conn, &recon).unwrap(), "completed", "no needs-review lines left, no exceptions");
 }
+
+// ===== Mapping-profile persistence (Spec 04 known-gap close) =====
+
+#[test]
+fn saved_profile_round_trips_a_single_amount_column_mapping() {
+    let w = world();
+    let map = CsvMapping {
+        header_rows: 1, date_col: 0, desc_col: 1, amount_col: Some(2), debit_col: None, credit_col: None,
+        date_format: "DMY".into(), flip_sign: true,
+    };
+    let id = save_import_profile(&w.conn, &w.company, &w.bank, "GTBank standard export", &map).unwrap();
+
+    let profiles = list_import_profiles(&w.conn, &w.company, &w.bank).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].id, id);
+    assert_eq!(profiles[0].label, "GTBank standard export");
+    let m = &profiles[0].mapping;
+    assert_eq!((m.header_rows, m.date_col, m.desc_col, m.amount_col, m.debit_col, m.credit_col), (1, 0, 1, Some(2), None, None));
+    assert_eq!(m.date_format, "DMY");
+    assert!(m.flip_sign);
+}
+
+#[test]
+fn saved_profile_round_trips_a_debit_credit_column_mapping() {
+    let w = world();
+    let map = CsvMapping {
+        header_rows: 2, date_col: 1, desc_col: 2, amount_col: None, debit_col: Some(3), credit_col: Some(4),
+        date_format: "YMD".into(), flip_sign: false,
+    };
+    save_import_profile(&w.conn, &w.company, &w.bank, "Zenith debit/credit export", &map).unwrap();
+
+    let profiles = list_import_profiles(&w.conn, &w.company, &w.bank).unwrap();
+    let m = &profiles[0].mapping;
+    assert_eq!((m.header_rows, m.date_col, m.desc_col, m.amount_col, m.debit_col, m.credit_col), (2, 1, 2, None, Some(3), Some(4)));
+    assert_eq!(m.date_format, "YMD");
+    assert!(!m.flip_sign);
+}
+
+#[test]
+fn profiles_are_scoped_to_their_bank_account_and_deletable() {
+    let mut w = world();
+    let other_bank = ledger_core::seed::add_bank_account(&mut w.conn, &w.company, "Zenith Savings", "bank", "NGN").unwrap();
+    let map = CsvMapping {
+        header_rows: 1, date_col: 0, desc_col: 1, amount_col: Some(2), debit_col: None, credit_col: None,
+        date_format: "DMY".into(), flip_sign: false,
+    };
+    let id = save_import_profile(&w.conn, &w.company, &w.bank, "Profile A", &map).unwrap();
+    save_import_profile(&w.conn, &w.company, &other_bank, "Profile B", &map).unwrap();
+
+    assert_eq!(list_import_profiles(&w.conn, &w.company, &w.bank).unwrap().len(), 1);
+    assert_eq!(list_import_profiles(&w.conn, &w.company, &other_bank).unwrap().len(), 1);
+
+    delete_import_profile(&w.conn, &id).unwrap();
+    assert_eq!(list_import_profiles(&w.conn, &w.company, &w.bank).unwrap().len(), 0);
+    assert_eq!(list_import_profiles(&w.conn, &w.company, &other_bank).unwrap().len(), 1, "deleting one profile doesn't touch the other");
+}

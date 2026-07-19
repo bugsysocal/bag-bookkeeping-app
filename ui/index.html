@@ -1096,6 +1096,7 @@ async function viewRecon(bankId, label){
     return;
   }
   const st = await invoke("recon_state",{reconId:open.id});
+  const profiles = await invoke("recon_list_profiles",{companyId:CO.id, bankAccountId:bankId});
   const row = l => {
     const [cls, lbl] = RCHIP[l.state] || ["draft", l.state];
     const acts = [];
@@ -1118,6 +1119,11 @@ async function viewRecon(bankId, label){
       · Still to sort out ${naira(st.unresolved_kobo)} · In your books at that date ${naira(st.ledger_at_date_kobo)}
       · In the books but not on this statement ${naira(st.outstanding_kobo)}</div>
     <details ${st.lines.length?"":"open"} style="margin:12px 0"><summary class="mut">Import the bank statement (CSV file)</summary>
+      ${profiles.length?`<div class="row" style="margin-top:8px">
+        <div><label>Saved column mapping</label><select id="m-profile"><option value="">— choose one, or set columns manually below —</option>
+          ${profiles.map(p=>`<option value="${p.id}">${esc(p.label)}</option>`).join("")}</select></div>
+        <div style="align-self:flex-end"><a class="navlink" id="m-profile-del">Delete this mapping</a></div>
+      </div>`:""}
       <div class="row" style="margin-top:8px">
         <div><label>File</label><input type="file" id="csvfile" accept=".csv,.txt"/></div>
         <div><label>Rows to skip (headers)</label><input type="text" id="m-skip" value="1"/></div>
@@ -1131,6 +1137,7 @@ async function viewRecon(bankId, label){
           <input type="text" id="m-dr" value="3"/><input type="text" id="m-cr" value="4"/></div></div>
       </div>
       <button class="ghost" id="doimport" style="margin-top:8px">Import</button>
+      <button class="ghost" id="m-save" style="margin-top:8px">Save this column mapping</button>
       <div class="mut" style="margin-top:4px">Column numbers count from 1, left to right. Lines already imported before are skipped automatically.</div>
     </details>
     ${st.lines.length?`<table><tr><th>Date</th><th>Bank says</th><th>Amount</th><th>Status</th><th></th></tr>
@@ -1139,12 +1146,52 @@ async function viewRecon(bankId, label){
       <button id="r-done">Finish checking</button></div></div>`);
   el("r-back").onclick = viewBank;
 
+  const col = id => Math.max(0, (parseInt(el(id).value,10)||1) - 1);
+
+  if (el("m-profile")){
+    el("m-profile").onchange = () => {
+      const p = profiles.find(p=>p.id===el("m-profile").value);
+      if (!p) return;
+      const m = p.mapping;
+      el("m-skip").value = m.header_rows;
+      el("m-fmt").value = m.date_format;
+      el("m-date").value = m.date_col + 1;
+      el("m-desc").value = m.desc_col + 1;
+      const dc = m.amount_col === null || m.amount_col === undefined;
+      el("m-mode").value = dc ? "dc" : "signed";
+      el("m-dr").value = (dc ? m.debit_col : m.amount_col) + 1;
+      el("m-cr").value = (m.credit_col!=null ? m.credit_col : 0) + 1;
+    };
+    el("m-profile-del").onclick = async () => {
+      const id = el("m-profile").value;
+      if (!id) return err({message:"Choose a saved mapping first."});
+      const p = profiles.find(p=>p.id===id);
+      if (!window.confirm(`Delete the saved mapping "${p.label}"? This doesn't affect anything already imported.`)) return;
+      try { await invoke("recon_delete_profile",{profileId:id}); viewRecon(bankId, label); } catch(e){ err(e); }
+    };
+  }
+
+  el("m-save").onclick = async () => {
+    const name = window.prompt("Name this column mapping (e.g. your bank's name):");
+    if (!name || !name.trim()) return;
+    const dc = el("m-mode").value === "dc";
+    try {
+      await invoke("recon_save_profile",{companyId:CO.id, bankAccountId:bankId, label:name.trim(), mapping:{
+        header_rows: parseInt(el("m-skip").value,10)||0,
+        date_col: col("m-date"), desc_col: col("m-desc"),
+        amount_col: dc ? null : col("m-dr"),
+        debit_col: dc ? col("m-dr") : null, credit_col: dc ? col("m-cr") : null,
+        date_format: el("m-fmt").value, flip_sign: false }});
+      toast(`Saved "${name.trim()}" — pick it from the dropdown next time you import for this account.`);
+      viewRecon(bankId, label);
+    } catch(e){ err(e); }
+  };
+
   el("doimport").onclick = async () => {
     const f = el("csvfile").files[0];
     if (!f) return err({message:"Choose the CSV file your bank gave you."});
     const text = await f.text();
     const dc = el("m-mode").value === "dc";
-    const col = id => Math.max(0, (parseInt(el(id).value,10)||1) - 1);
     try {
       const res = await invoke("recon_import_csv",{reconId:open.id, csvText:text, mapping:{
         header_rows: parseInt(el("m-skip").value,10)||0,

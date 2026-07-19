@@ -1546,7 +1546,7 @@ fn recon_start(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: St
         .map_err(Into::into)
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct MappingDto {
     pub header_rows: usize,
     pub date_col: usize,
@@ -1582,6 +1582,58 @@ fn recon_import_csv(state: tauri::State<Db>, sess: tauri::State<Sess>, recon_id:
     }
     let (imported, skipped) = recon::import_rows(&mut conn, &recon_id, &rows)?;
     Ok(ImportResultDto { imported, skipped, errors })
+}
+
+// ===== Bank-import mapping-profile persistence (Spec 04 known-gap close) =====
+
+#[derive(Serialize)]
+struct ImportProfileDto {
+    id: String,
+    label: String,
+    mapping: MappingDto,
+}
+
+#[tauri::command]
+fn recon_list_profiles(state: tauri::State<Db>, company_id: String, bank_account_id: String) -> Result<Vec<ImportProfileDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let profiles = recon::list_import_profiles(&conn, &company_id, &bank_account_id)?;
+    Ok(profiles
+        .into_iter()
+        .map(|p| ImportProfileDto {
+            id: p.id, label: p.label,
+            mapping: MappingDto {
+                header_rows: p.mapping.header_rows, date_col: p.mapping.date_col, desc_col: p.mapping.desc_col,
+                amount_col: p.mapping.amount_col, debit_col: p.mapping.debit_col, credit_col: p.mapping.credit_col,
+                date_format: p.mapping.date_format, flip_sign: p.mapping.flip_sign,
+            },
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn recon_save_profile(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, bank_account_id: String,
+    label: String, mapping: MappingDto,
+) -> Result<String, CmdError> {
+    sess.0.require_session()?;
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return Err(CmdError { code: "label_required", message: "Give this mapping a name to save it.".into(), detail: None });
+    }
+    let conn = state.0.lock().unwrap();
+    let map = recon::CsvMapping {
+        header_rows: mapping.header_rows, date_col: mapping.date_col, desc_col: mapping.desc_col,
+        amount_col: mapping.amount_col, debit_col: mapping.debit_col, credit_col: mapping.credit_col,
+        date_format: mapping.date_format, flip_sign: mapping.flip_sign,
+    };
+    recon::save_import_profile(&conn, &company_id, &bank_account_id, &label, &map).map_err(Into::into)
+}
+
+#[tauri::command]
+fn recon_delete_profile(state: tauri::State<Db>, sess: tauri::State<Sess>, profile_id: String) -> Result<(), CmdError> {
+    sess.0.require_session()?;
+    let conn = state.0.lock().unwrap();
+    recon::delete_import_profile(&conn, &profile_id).map_err(Into::into)
 }
 
 #[derive(Serialize)]
@@ -2034,6 +2086,9 @@ pub fn run() {
             recon_open,
             recon_start,
             recon_import_csv,
+            recon_list_profiles,
+            recon_save_profile,
+            recon_delete_profile,
             recon_state,
             recon_candidates,
             recon_match,

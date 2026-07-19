@@ -510,3 +510,95 @@ pub fn complete(conn: &mut Connection, recon_id: &str) -> R<String> {
     tx.commit()?;
     Ok(new_status.to_string())
 }
+
+// ===== Import mapping profiles (Spec 04 known-gap close: persist the column
+// mapping per bank account so the reconcile screen stops re-asking on every
+// import) =====
+
+/// A saved profile as read back from `bank_import_profiles`.
+pub struct SavedProfile {
+    pub id: String,
+    pub label: String,
+    pub mapping: CsvMapping,
+}
+
+pub fn save_import_profile(
+    conn: &Connection, company_id: &str, bank_account_id: &str, label: &str, map: &CsvMapping,
+) -> R<String> {
+    let id = new_id();
+    let sign_convention = if map.flip_sign { "flip" } else { "normal" };
+    conn.execute(
+        "INSERT INTO bank_import_profiles (id, company_id, bank_account_id, label, mapping_json,
+                                            date_format, sign_convention, header_rows, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id, company_id, bank_account_id, label, encode_mapping_json(map),
+            map.date_format, sign_convention, map.header_rows as i64, now_iso()
+        ],
+    )?;
+    Ok(id)
+}
+
+pub fn list_import_profiles(conn: &Connection, company_id: &str, bank_account_id: &str) -> R<Vec<SavedProfile>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, label, mapping_json, date_format, sign_convention, header_rows
+         FROM bank_import_profiles WHERE company_id = ?1 AND bank_account_id = ?2 ORDER BY label",
+    )?;
+    let out = stmt
+        .query_map(params![company_id, bank_account_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(id, label, mapping_json, date_format, sign_convention, header_rows)| {
+            let (date_col, desc_col, amount_col, debit_col, credit_col) = decode_mapping_json(&mapping_json);
+            SavedProfile {
+                id, label,
+                mapping: CsvMapping {
+                    header_rows: header_rows as usize, date_col, desc_col, amount_col, debit_col, credit_col,
+                    date_format, flip_sign: sign_convention == "flip",
+                },
+            }
+        })
+        .collect();
+    Ok(out)
+}
+
+pub fn delete_import_profile(conn: &Connection, profile_id: &str) -> R<()> {
+    conn.execute("DELETE FROM bank_import_profiles WHERE id = ?1", params![profile_id])?;
+    Ok(())
+}
+
+/// Hand-written, not a general JSON library — `ledger-core` has no serde
+/// dependency (same call as the chrono ban in `ids.rs`: a tiny from-scratch
+/// codec beats a heavy dependency for something this narrow). Encodes only
+/// the column-index fields; `header_rows`/`date_format`/`sign_convention`
+/// already have their own columns per the existing schema.
+fn encode_mapping_json(map: &CsvMapping) -> String {
+    fn opt(v: Option<usize>) -> String {
+        v.map(|x| x.to_string()).unwrap_or_else(|| "null".into())
+    }
+    format!(
+        "{{\"date_col\":{},\"desc_col\":{},\"amount_col\":{},\"debit_col\":{},\"credit_col\":{}}}",
+        map.date_col, map.desc_col, opt(map.amount_col), opt(map.debit_col), opt(map.credit_col)
+    )
+}
+
+fn decode_mapping_json(json: &str) -> (usize, usize, Option<usize>, Option<usize>, Option<usize>) {
+    fn field(json: &str, key: &str) -> Option<String> {
+        let needle = format!("\"{key}\":");
+        let start = json.find(&needle)? + needle.len();
+        let rest = &json[start..];
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    }
+    let date_col = field(json, "date_col").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let desc_col = field(json, "desc_col").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let amount_col = field(json, "amount_col").and_then(|s| s.parse().ok());
+    let debit_col = field(json, "debit_col").and_then(|s| s.parse().ok());
+    let credit_col = field(json, "credit_col").and_then(|s| s.parse().ok());
+    (date_col, desc_col, amount_col, debit_col, credit_col)
+}
