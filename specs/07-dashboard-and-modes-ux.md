@@ -80,7 +80,7 @@ Left rail, owner language:
 | Tax flags (`vat_registered`, `vat_exempt`, `cit_exempt`), VAT rate, WHT presets | Spec 02 #8 revised |
 | Compliance banner clearing / acknowledgment | Spec 02 §5.9 |
 | WHT exemption override (both directions), incl. `cit_exempt` gating judgment | Spec 01 §6.2 / Spec 04 §3 |
-| Write-off above `writeoff_limit_kobo`; write-off routing settings | Spec 04 §7.5 |
+| ~~Write-off above `writeoff_limit_kobo`~~ **SUPERSEDED 2026-07-07 — Spec 04 §9 Decision #11 (closed, final): there is no Advisor-Mode bypass of the write-off limit, for any role, ever.** Above the limit, the only path is an ordinary manual journal entry matched via the standard manual-match flow — not a mode capability. Write-off *routing settings* (the limit amount itself, and the write-off Dr/Cr accounts) remain an Advisor-only capability in principle, but **no settings command exists yet to change them post-setup** — they're seeded once at company creation and are currently read-only. | Spec 04 §7.5, §9 Decision #11 |
 | Needs-review queue (cross-account triage view) | Spec 04 §7.5 |
 | OBE reclassification to Capital/Retained Earnings | Spec 02 §5.6 |
 | Opening-balance void & repost | Spec 02 §5.9 |
@@ -88,6 +88,8 @@ Left rail, owner language:
 | `fiscal_year_start_month` change after first posting | Spec 02 §5.9 |
 | Bulk transaction import | Spec 06 §4 |
 | Back-dating reversals within open periods | Spec 03 §6 |
+
+**Implementation-status footnote (added 2026-07-19, not part of the original approval — kept here so this table doesn't quietly drift further from reality):** as of Spec 07 build start, only two rows above have both an engine function *and* a Tauri command gated with `require_advisor_elevated`: **Trial balance, GL detail** (`trial_balance`/`general_ledger` commands) and, by extension, their `.xlsx` exports (Spec 06). Everything else in the table is either engine-only with no UI/IPC surface at all (manual journals — `engine::post_journal` exists, no Tauri command wraps it; OBE reclassification; opening-balance void & repost; bulk transaction import), or a company setting that's only ever set once at wizard time with no post-setup edit command (hard period lock, tax flags/VAT rate/WHT presets, inventory on/off, `fiscal_year_start_month`, write-off routing settings) — so there's nothing yet to *gate*. **Compliance banner clearing/acknowledgment** has no banner UI at all yet (that's Spec 07 §2.3's own job to build). One capability-gating question flagged during Spec 07 build, not resolved by this table as written: "WHT exemption override (both directions)" — the routine case of a supplier with no TIN needing an explicit withholding-amount decision at payment time (`EngineError::WhtDecisionRequired`) is currently reachable by *any* session role via `record_payment_out`, not gated to Advisor Mode, because a payment can't stall on advisor availability. Whether that's the capability this table means, versus a not-yet-built "permanently mark this supplier WHT-exempt" or "override the `cit_exempt` gating judgment" settings screen, is genuinely ambiguous from the table's wording alone — see PROGRESS.md's "Flagged for review" for the decision on record.
 
 Everything not listed is Owner Mode (subject to the Spec 02 role matrix — staff restrictions ride the *role*, not the mode).
 

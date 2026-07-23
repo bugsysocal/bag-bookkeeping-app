@@ -195,6 +195,12 @@ pub struct DashboardDto {
     /// Spec 07 §2.1 tile #3 named line: tax collected/held, not yet remitted.
     pub unremitted_tax_kobo: i64,
     pub profit_this_month_kobo: i64,
+    /// Spec 07 §2.1 tile #5: count + value, derived (never stored) same as Spec 03 §2.
+    pub overdue_count: i64,
+    pub overdue_kobo: i64,
+    /// Spec 07 §2.3 banner #2 ("Needs review"): flagged bank lines across every
+    /// reconciliation for this company, not just the one currently open.
+    pub needs_review_count: i64,
 }
 
 // ===== Commands =====
@@ -465,6 +471,30 @@ fn dashboard(state: tauri::State<Db>, company_id: String) -> Result<DashboardDto
         )
         .map_err(db_err)?;
 
+    // Tile #5 (Spec 07 §2.1): overdue = sent/partially_paid AND due_date in the
+    // past, derived here exactly like list_invoices' per-row `overdue` flag
+    // (Spec 03 §2 — never stored).
+    let today = &ledger_core::ids::now_iso()[0..10];
+    let (overdue_count, overdue_kobo): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(total_kobo - amount_paid_kobo), 0)
+             FROM invoices
+             WHERE company_id = ?1 AND kind = 'invoice' AND status IN ('sent','partially_paid') AND due_date < ?2",
+            rusqlite::params![company_id, today],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(db_err)?;
+
+    let needs_review_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reconciliation_lines rl
+             JOIN reconciliations r ON r.id = rl.reconciliation_id
+             WHERE r.company_id = ?1 AND rl.state = 'needs_review'",
+            rusqlite::params![company_id],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+
     Ok(DashboardDto {
         cash_accounts,
         cash_total_kobo: cash_total,
@@ -472,6 +502,9 @@ fn dashboard(state: tauri::State<Db>, company_id: String) -> Result<DashboardDto
         what_i_owe_kobo: what_i_owe,
         unremitted_tax_kobo: unremitted_tax,
         profit_this_month_kobo: profit,
+        overdue_count,
+        overdue_kobo,
+        needs_review_count,
     })
 }
 

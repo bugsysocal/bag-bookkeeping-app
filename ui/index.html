@@ -25,6 +25,14 @@
   .chip.draft { background:#f1f5f9; color:#475569; } .chip.void { background:#f1f5f9; color:#94a3b8; text-decoration:line-through; }
   a.navlink { color:var(--green); cursor:pointer; text-decoration:none; font-weight:600; margin-right:14px; }
   tr.rowlink:hover td { background:#f8faf8; cursor:pointer; }
+  /* Banner zone (Spec 07 §2.3): the only place the app nags. Priority-ordered,
+     max two shown + expander — never a wall of banners. */
+  .banners { padding:10px 26px; }
+  .banner-row { padding:8px 4px; border-bottom:1px solid #f1f5f9; font-size:14px; }
+  .banner-row:last-child { border-bottom:none; }
+  .banner-row.rowlink:hover { background:#fefce8; cursor:pointer; }
+  .amt-preview { display:inline-block; margin-left:6px; font-size:12px; color:var(--green); font-weight:600; }
+  .amt-preview:empty { margin-left:0; }
   /* Session strip (Spec 07 §5): who's using it, and — when elevated — an
      unmistakable badge. A screenshot must be unambiguous about mode. */
   .sessionbar { display:flex; align-items:center; gap:10px; margin:0 0 10px; font-size:13px; color:var(--mut); }
@@ -70,8 +78,46 @@
 const invoke = window.__TAURI__.core.invoke;
 const EULA_VERSION = "EULA-DRAFT-1";
 const naira = k => "₦" + (k/100).toLocaleString("en-NG",{minimumFractionDigits:2});
-const kobo = s => { const n = parseFloat(String(s||"0").replace(/[₦,\s]/g,"")); return isNaN(n) ? 0 : Math.round(n*100); };
+// Spec 07 §4.2 Decision #4: "k" = thousand, "m" = million shorthand (2.5m -> ₦2,500,000).
+const kobo = s => {
+  let str = String(s||"0").replace(/[₦,\s]/g,"").trim();
+  let mult = 1;
+  const suffix = str.slice(-1).toLowerCase();
+  if (suffix === "k"){ mult = 1000; str = str.slice(0,-1); }
+  else if (suffix === "m"){ mult = 1000000; str = str.slice(0,-1); }
+  const n = parseFloat(str);
+  return isNaN(n) ? 0 : Math.round(n*mult*100);
+};
 const esc = s => String(s??"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// Spec 07 §4.2 Decision #4: the shorthand's expansion is previewed live, never
+// applied silently. Delegated on `document` (not wired per-screen) so every
+// amount field — present and future — gets it for free; amount fields are the
+// ones sharing the `placeholder="0.00"` convention used throughout this file.
+document.addEventListener("input", e => {
+  const inp = e.target;
+  if (!(inp.tagName === "INPUT" && inp.getAttribute("placeholder") === "0.00")) return;
+  let preview = inp.nextElementSibling;
+  if (!preview || !preview.classList || !preview.classList.contains("amt-preview")){
+    preview = document.createElement("span");
+    preview.className = "amt-preview mut";
+    inp.insertAdjacentElement("afterend", preview);
+  }
+  const v = inp.value.trim();
+  if (/[km]$/i.test(v) && !isNaN(parseFloat(v.slice(0,-1)))){
+    preview.textContent = `→ ${naira(kobo(v))}`;
+  } else {
+    preview.textContent = "";
+  }
+});
+
+// Spec 07 §6: Ctrl+1/2/3 for the three primary actions, from anywhere in the app.
+document.addEventListener("keydown", e => {
+  if (!e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === "1" && el("a-newinv")){ e.preventDefault(); el("a-newinv").click(); }
+  else if (e.key === "2" && el("a-exp")){ e.preventDefault(); el("a-exp").click(); }
+  else if (e.key === "3" && el("a-pay")){ e.preventDefault(); el("a-pay").click(); }
+});
 
 // Wizard state (Spec 02 §5) — committed atomically at the end, nothing before.
 const S = {
@@ -110,6 +156,9 @@ function shell(title, sub, body, canBack=true, nextLabel="Continue"){
 }
 
 // ── Step 0: EULA gate (Spec 10 §5b) — full text in docs/legal/EULA.md
+// LEXICON-EXEMPT: legal text, not bookkeeping UI copy — "liability" here means
+// legal liability, not the balance-sheet account class (Spec 07 §4.1 is about
+// double-entry jargon leaking into Owner Mode accounting screens, not EULAs).
 function eulaStep(){
   el("main").innerHTML = `<div class="card">
     <h3>Before you start</h3>
@@ -394,6 +443,7 @@ function chrome(active, body){
       <a class="navlink" id="n-contacts">Contacts</a>
       <a class="navlink" id="n-products">Products</a>
       <a class="navlink" id="n-reports">Reports</a>
+      <span id="n-advisor-wrap"></span>
       <span class="spacer"></span>
       <button id="a-newinv">New Invoice</button>
       <button class="ghost" id="a-exp">Record Expense</button>
@@ -409,6 +459,21 @@ function chrome(active, body){
   el("a-pay").onclick = () => viewRecordPayment();
   el("n-switch").onclick = async () => { await invoke("logout"); SESSION = null; viewUserPicker(); };
   paintAdvisorControl(active, body);
+  paintAdvisorNavItem();
+}
+
+// Spec 07 §3 Decision #3: the Advisor rail item is visible-but-locked in Owner
+// Mode (not hidden) — advertising a deeper layer exists builds trust. Staff is
+// the one exception: never eligible (Spec 07 §5), so never shown at all.
+function paintAdvisorNavItem(){
+  const box = el("n-advisor-wrap");
+  if (!box || !SESSION || SESSION.role === "staff") return;
+  const locked = !SESSION.advisor_active;
+  box.innerHTML = `<a class="navlink" id="n-advisor">Advisor ${locked?"🔒":"🔓"}</a>`;
+  el("n-advisor").onclick = () => {
+    if (SESSION.advisor_active){ REPORT_TAB = "advisor"; viewReports(); return; }
+    if (el("advisor-open")) el("advisor-open").click();
+  };
 }
 
 // Staff never sees an elevation control at all (Spec 07 §5: eligible = owner/advisor).
@@ -437,8 +502,49 @@ function paintAdvisorControl(active, body){
   };
 }
 
+// Spec 07 §2.3 banner zone: fixed priority order, max two visible + "n more"
+// expander. Only slots with real, actionable data render at all — a banner
+// that's always empty is still decorative, so it's simply omitted rather than
+// shown as "0 items". Compliance/backup-health/recurring-due have no backing
+// data yet (see PROGRESS.md "Flagged for review") and are left out entirely
+// until they do, rather than faked with a placeholder.
+function dashboardBanners(dd){
+  const candidates = [];
+  if (dd.needs_review_count > 0) candidates.push({
+    key: "needs_review", priority: 2,
+    text: `${dd.needs_review_count} bank line${dd.needs_review_count===1?"":"s"} flagged "not sure" — worth a look`,
+    go: viewBank,
+  });
+  candidates.sort((a,b)=>a.priority-b.priority);
+  return candidates;
+}
+
+function renderBanners(candidates){
+  if (!candidates.length) return "";
+  const shown = candidates.slice(0,2), rest = candidates.slice(2);
+  const row = (c,i) => `<div class="banner-row rowlink" data-bidx="${i}">${esc(c.text)}</div>`;
+  return `<div class="card banners no-print">
+    ${shown.map(row).join("")}
+    ${rest.length?`<a class="navlink" id="banners-more">+${rest.length} more</a>`:""}
+  </div>`;
+}
+
+function wireBanners(candidates){
+  const shown = candidates.slice(0,2), rest = candidates.slice(2);
+  document.querySelectorAll("[data-bidx]").forEach(b => {
+    const c = shown[parseInt(b.dataset.bidx,10)];
+    if (c) b.onclick = c.go;
+  });
+  if (el("banners-more")) el("banners-more").onclick = () => {
+    // Expander: reveal the rest inline rather than navigating away.
+    el("banners-more").outerHTML = rest.map(c=>`<div class="banner-row rowlink" data-brest="${c.key}">${esc(c.text)}</div>`).join("");
+    rest.forEach(c => { const n = document.querySelector(`[data-brest="${c.key}"]`); if (n) n.onclick = c.go; });
+  };
+}
+
 async function viewDashboard(){
   const dd = await invoke("dashboard",{companyId:CO.id});
+  const banners = dashboardBanners(dd);
   chrome("home", `<div class="card"><h3>${esc(CO.name)}</h3>
     <div class="mut">Cash today</div><div class="num">${naira(dd.cash_total_kobo)}</div>
     <table>${dd.cash_accounts.map(a=>`<tr><td>${esc(a.label)}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("")}</table>
@@ -447,8 +553,13 @@ async function viewDashboard(){
       <tr><td>What I owe ${dd.unremitted_tax_kobo>0?`<span class="mut">(incl. ${naira(dd.unremitted_tax_kobo)} tax collected, not yet remitted)</span>`:""}</td>
           <td>${naira(dd.what_i_owe_kobo)}</td></tr>
       <tr><td>Profit this month</td><td>${naira(dd.profit_this_month_kobo)}</td></tr>
-    </table></div>`);
+      <tr class="rowlink" id="t-overdue"><td>Overdue invoices</td>
+          <td>${dd.overdue_count>0?`${dd.overdue_count} · ${naira(dd.overdue_kobo)}`:"None"}</td></tr>
+    </table></div>
+    ${renderBanners(banners)}`);
   el("t-owes").onclick = viewInvoices;
+  el("t-overdue").onclick = viewInvoices;
+  wireBanners(banners);
 }
 
 // ── Sales register: invoices + quotes (Spec 03 §2/§3; Overdue derived, never stored)
@@ -1132,8 +1243,8 @@ async function viewRecon(bankId, label){
       <div class="row">
         <div><label>Date column #</label><input type="text" id="m-date" value="1"/></div>
         <div><label>Description column #</label><input type="text" id="m-desc" value="2"/></div>
-        <div><label>Amount style</label><select id="m-mode"><option value="dc">Debit + credit columns</option><option value="signed">One signed column</option></select></div>
-        <div id="m-dcwrap"><label>Debit / credit col #</label><div class="row">
+        <div><label>Amount style</label><select id="m-mode"><option value="dc">Two columns (money in / money out)</option><option value="signed">One signed column</option></select></div>
+        <div id="m-dcwrap"><label>Money in / money out column #</label><div class="row">
           <input type="text" id="m-dr" value="3"/><input type="text" id="m-cr" value="4"/></div></div>
       </div>
       <button class="ghost" id="doimport" style="margin-top:8px">Import</button>
@@ -1510,6 +1621,8 @@ async function renderOwnerReports(){
 }
 
 // ── Formal statements: Income Statement (accrual/cash toggle), Balance Sheet, Cash Flow (§4) ──
+// LEXICON-EXEMPT: formal statements are the named exception in Spec 07 §4.1 —
+// these words appear "only in Advisor Mode and on formal statements".
 async function renderStatements(){
   const box = el("reportbody");
   box.innerHTML = `
@@ -1529,6 +1642,7 @@ async function renderStatements(){
   await paintStatements();
 }
 
+// LEXICON-EXEMPT: formal statement, Spec 07 §4.1's named exception.
 async function paintStatements(){
   const p = REPORT_PERIODS[STMT_PERIOD];
   const body = el("stmtbody");
@@ -1612,6 +1726,9 @@ async function renderTaxReports(){
   await paintTax();
 }
 
+// LEXICON-EXEMPT: FIRS-facing tax schedules (VAT/WHT), the same "filing-shaped,
+// not owner-dashboard" category as formal statements — "credit" here is the
+// ordinary tax-filing term (WHT/input credit), not raw double-entry jargon.
 async function paintTax(){
   const body = el("taxbody");
   body.innerHTML = `<div class="mut">Loading…</div>`;
@@ -1655,6 +1772,7 @@ async function paintTax(){
 // ── Advisor tier: Trial Balance + General Ledger (§4.5) — the first real
 //    UI consumer of require_advisor_elevated; not shown at all to staff,
 //    and shows a plain-language nudge (not an error) when not yet elevated.
+// LEXICON-EXEMPT: Advisor Mode only, Spec 07 §4.1's other named exception.
 async function renderAdvisorReports(){
   const box = el("reportbody");
   if (SESSION.role === "staff"){ box.innerHTML = `<div class="mut">Not available for your role.</div>`; return; }
