@@ -4,6 +4,8 @@
 //! accrual/liability/equity in owner strings), recoverable, with the raw
 //! technical detail carried separately for Advisor Mode display.
 
+mod backup_shell;
+
 use ledger_core::auth::SessionStore;
 use ledger_core::engine::{self, PostCtx};
 use ledger_core::rusqlite::{self, Connection, OptionalExtension};
@@ -2309,6 +2311,7 @@ pub fn run() {
             let conn = ledger_core::open(db_path.to_str().expect("utf8 path"))?;
             app.manage(Db(Mutex::new(conn)));
             app.manage(Sess(SessionStore::new()));
+            backup_shell::spawn_scheduler(&app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2407,8 +2410,23 @@ pub fn run() {
             export_general_ledger_xlsx,
             export_vat_report_xlsx,
             export_wht_remittance_xlsx,
-            export_wht_credit_xlsx
+            export_wht_credit_xlsx,
+            backup_shell::backup_settings_get,
+            backup_shell::backup_settings_update,
+            backup_shell::backup_now,
+            backup_shell::backup_list,
+            backup_shell::backup_health,
+            backup_shell::restore_preview,
+            backup_shell::restore_backup
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running LedgerOne");
+        .build(tauri::generate_context!())
+        .expect("error while building LedgerOne")
+        .run(|app_handle, event| {
+            // Spec 08 §3: back up on clean exit too (if due), same as the
+            // background scheduler — the app shouldn't have to stay open 15
+            // more minutes just to catch the exit-time backup.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                backup_shell::run_backup_if_due(app_handle, false);
+            }
+        });
 }

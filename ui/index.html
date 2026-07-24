@@ -507,16 +507,24 @@ function paintAdvisorControl(active, body){
 // Spec 07 §2.3 banner zone: fixed priority order, max two visible + "n more"
 // expander. Only slots with real, actionable data render at all — a banner
 // that's always empty is still decorative, so it's simply omitted rather than
-// shown as "0 items". Compliance/backup-health/recurring-due have no backing
-// data yet (see PROGRESS.md "Flagged for review") and are left out entirely
+// shown as "0 items". Recurring due and Setup gaps have no backing data yet
+// (no recurring-templates UI, no gap-detection) and are left out entirely
 // until they do, rather than faked with a placeholder.
-function dashboardBanners(dd){
+async function dashboardBanners(dd){
   const candidates = [];
+  const [compliance, health] = await Promise.all([
+    invoke("compliance_banners_cmd",{companyId:CO.id}),
+    invoke("backup_health"),
+  ]);
+  compliance.forEach(b => candidates.push({
+    key: `compliance_${b.kind}`, priority: 1, text: b.message, go: viewSettings,
+  }));
   if (dd.needs_review_count > 0) candidates.push({
     key: "needs_review", priority: 2,
     text: `${dd.needs_review_count} bank line${dd.needs_review_count===1?"":"s"} flagged "not sure" — worth a look`,
     go: viewBank,
   });
+  if (health.message) candidates.push({ key: "backup_health", priority: 3, text: health.message, go: viewSettings });
   candidates.sort((a,b)=>a.priority-b.priority);
   return candidates;
 }
@@ -546,7 +554,7 @@ function wireBanners(candidates){
 
 async function viewDashboard(){
   const dd = await invoke("dashboard",{companyId:CO.id});
-  const banners = dashboardBanners(dd);
+  const banners = await dashboardBanners(dd);
   chrome("home", `<div class="card"><h3>${esc(CO.name)}</h3>
     <div class="mut">Cash today</div><div class="num">${naira(dd.cash_total_kobo)}</div>
     <table>${dd.cash_accounts.map(a=>`<tr><td>${esc(a.label)}</td><td>${naira(a.balance_kobo)}</td></tr>`).join("")}</table>
@@ -1573,6 +1581,30 @@ let JOURNAL_LINES = [{acct:"", amt:"", contact:""}, {acct:"", amt:"", contact:""
 // and those don't use the forbidden words.
 async function viewSettings(){
   const banners = await invoke("compliance_banners_cmd",{companyId:CO.id});
+  const [bset, blist, bhealth] = await Promise.all([
+    invoke("backup_settings_get"), invoke("backup_list"), invoke("backup_health"),
+  ]);
+  const canManageBackups = SESSION.role !== "staff";
+  const healthChip = {ok:["paid","All good"], warning:["partially_paid","Needs attention"], critical:["overdue","Critical"]}[bhealth.state];
+  const backupsHtml = `<div class="card"><h3>Backups</h3>
+    <div class="ok">Status: <span class="chip ${healthChip[0]}">${healthChip[1]}</span>
+      ${bset.last_attempt_at?` · Last attempt ${dmy(bset.last_attempt_at.slice(0,10))} ${bset.last_attempt_ok?"(succeeded)":"(failed)"}`:" · No backup has run yet"}</div>
+    ${bhealth.message?`<div class="mut" style="margin-top:6px">${esc(bhealth.message)}</div>`:""}
+    <div class="row" style="margin-top:10px">
+      <div style="flex:2"><label>Backup folder</label><input type="text" id="b-dest" value="${esc(bset.destination)}" ${canManageBackups?"":"disabled"}/></div>
+      <div><label><input type="checkbox" id="b-enabled" ${bset.enabled?"checked":""} ${canManageBackups?"":"disabled"}/> Automatic backups on</label></div>
+    </div>
+    ${canManageBackups?`<button class="ghost" id="b-save" style="margin-top:8px">Save backup settings</button>
+      <button id="b-now" style="margin-top:8px">Back up now</button>`:""}
+    <div class="mut" style="margin-top:8px">A backup that leaves this machine (a synced folder, a USB drive) protects you if this computer is lost or stolen.</div>
+    <table style="margin-top:12px"><tr><th>When</th><th>Kind</th><th>Size</th><th>Verified</th><th></th></tr>
+      ${blist.map(b=>`<tr><td>${dmy(b.timestamp.slice(0,10))} ${b.timestamp.slice(11,16)}</td><td>${esc(b.tier)}</td>
+        <td>${(b.size_bytes/1024).toFixed(0)} KB</td><td>${b.verified?"✓":"✗"}</td>
+        <td>${canManageBackups?`<a class="navlink" data-restore="${esc(b.filename)}" data-restoredir="${esc(bset.destination)}">Restore this</a>`:""}</td></tr>`).join("")}
+      ${!blist.length?`<tr><td colspan="5" class="mut">No backups yet.</td></tr>`:""}
+    </table>
+    <div id="restorearea"></div>
+  </div>`;
   const complianceHtml = `<div class="card"><h3>Compliance</h3>
     ${banners.length ? banners.map(b=>`<div class="banner-row">${esc(b.message)}
         ${SESSION.advisor_active?`<a class="navlink" data-ack="${b.kind}" style="margin-left:8px">Reviewed, no change needed for now</a>`:""}</div>`).join("")
@@ -1631,7 +1663,7 @@ async function viewSettings(){
     ${complianceHtml}
     <div class="card"><h3>Tax &amp; period settings</h3>${advisorHtml}</div>
     ${journalHtml}
-    <div id="backupsection"></div>`);
+    ${backupsHtml}`);
 
   document.querySelectorAll("[data-ack]").forEach(a => a.onclick = async () => {
     try {
@@ -1681,6 +1713,52 @@ async function viewSettings(){
       } catch(e){ err(e); }
     };
   }
+
+  if (el("b-save")) el("b-save").onclick = async () => {
+    try {
+      await invoke("backup_settings_update",{destination:el("b-dest").value||null, enabled:el("b-enabled").checked});
+      toast("Backup settings saved.");
+      viewSettings();
+    } catch(e){ err(e); }
+  };
+  if (el("b-now")) el("b-now").onclick = async () => {
+    try { await invoke("backup_now"); toast("Backup completed and verified."); viewSettings(); }
+    catch(e){ err(e); }
+  };
+  document.querySelectorAll("[data-restore]").forEach(a => a.onclick = async () => {
+    const filename = a.dataset.restore, dir = a.dataset.restoredir;
+    const candidatePath = dir + (dir.endsWith("\\")||dir.endsWith("/") ? "" : "\\") + filename;
+    try {
+      const preview = await invoke("restore_preview",{candidatePath});
+      const area = el("restorearea");
+      area.innerHTML = `<div class="card" style="border:2px solid #991b1b">
+        <h3>Restore from this backup?</h3>
+        <div class="mut">You are about to return to your books as of ${preview.last_entry_date?dmy(preview.last_entry_date):"—"}
+          (${preview.journal_entry_count} recorded entries). Everything recorded after that moment will be gone from the app —
+          your current books are kept aside as a safety copy first, automatically. Companies in this backup: ${esc(preview.companies.join(", ")||"—")}.</div>
+        <div class="row" style="margin-top:8px"><div><label>Type the exact company name to confirm</label>
+          <input type="text" id="restore-confirm" placeholder="${esc(preview.companies[0]||"")}"/></div></div>
+        <div class="nav"><button class="ghost" id="restore-cancel">Cancel</button>
+          <button id="restore-go" style="background:#991b1b">Restore now</button></div>
+      </div>`;
+      el("restore-cancel").onclick = () => { area.innerHTML = ""; };
+      el("restore-go").onclick = async () => {
+        try {
+          await invoke("restore_backup",{candidatePath, typedCompanyName:el("restore-confirm").value});
+          // The whole database just changed underneath the current session —
+          // its user/company may not even exist in the restored copy anymore.
+          // Safest path: log out and re-run the normal launch sequence.
+          await invoke("logout").catch(()=>{});
+          SESSION = null; CO = null;
+          toast("Restore complete.");
+          const cs = await invoke("list_companies");
+          if (!cs.length){ render(); return; }
+          CO = cs[0];
+          viewUserPicker();
+        } catch(e){ err(e); }
+      };
+    } catch(e){ err(e); }
+  });
 }
 
 // ════════ Reports (Spec 05) ════════

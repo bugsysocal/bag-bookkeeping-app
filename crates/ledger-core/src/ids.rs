@@ -18,6 +18,35 @@ pub fn now_iso() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// (year, month, day) → days since 1970-01-01 (Howard Hinnant's algorithm),
+/// the inverse of `civil_from_days`. `pub` since `reports.rs` (day bucketing)
+/// and the shell's backup scheduler (elapsed-time checks) both need it —
+/// one proleptic-calendar implementation, not two copies drifting apart.
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe.div_euclid(4) - yoe.div_euclid(100) + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Inverse of `now_iso` — total seconds since the epoch for one of this
+/// crate's own `"YYYY-MM-DDTHH:MM:SSZ"` timestamps. Used for elapsed-time
+/// checks (e.g. the backup scheduler's "> 4h since last success"), not
+/// financial dates — those stay plain `YYYY-MM-DD` string comparison
+/// throughout the crate, which sorts and compares correctly without this.
+pub fn parse_iso_to_epoch_secs(ts: &str) -> i64 {
+    let y: i64 = ts[0..4].parse().unwrap_or(1970);
+    let mo: u32 = ts[5..7].parse().unwrap_or(1);
+    let d: u32 = ts[8..10].parse().unwrap_or(1);
+    let h: i64 = ts.get(11..13).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mi: i64 = ts.get(14..16).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let s: i64 = ts.get(17..19).and_then(|s| s.parse().ok()).unwrap_or(0);
+    days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s
+}
+
 /// days since 1970-01-01 → (year, month, day) in the proleptic Gregorian calendar.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
