@@ -1140,6 +1140,54 @@ fn list_invoices(state: tauri::State<Db>, company_id: String) -> Result<Vec<Invo
     Ok(rows)
 }
 
+// ===== Customer deposits ("paid ahead", Spec 03 §5) — engine-tested, no UI before this =====
+
+#[derive(Serialize)]
+struct CustomerDepositDto { contact_id: String, name: String, deposit_kobo: i64 }
+
+#[tauri::command]
+fn list_customer_deposits(state: tauri::State<Db>, company_id: String) -> Result<Vec<CustomerDepositDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let mut q = conn.prepare(
+        "SELECT c.id, c.name, COALESCE(-SUM(l.amount_kobo), 0) AS deposit_kobo
+         FROM contacts c
+         JOIN journal_lines l ON l.contact_id = c.id
+         JOIN journal_entries e ON e.id = l.entry_id
+         JOIN accounts a ON a.id = l.account_id
+         WHERE c.company_id = ?1 AND e.is_posted = 1 AND a.system_key = 'UNEARNED_REVENUE'
+         GROUP BY c.id HAVING deposit_kobo != 0
+         ORDER BY c.name",
+    ).map_err(db_err)?;
+    let rows = q.query_map(rusqlite::params![company_id], |r| {
+        Ok(CustomerDepositDto { contact_id: r.get(0)?, name: r.get(1)?, deposit_kobo: r.get(2)? })
+    }).map_err(db_err)?.collect::<Result<Vec<_>, _>>().map_err(db_err)?;
+    Ok(rows)
+}
+
+#[tauri::command]
+fn apply_deposit_cmd(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, contact_id: String,
+    invoice_id: String, amount_kobo: i64, application_date: String, confirm_soft_close: bool,
+) -> Result<String, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    let c = ctx(&sess, confirm_soft_close)?;
+    engine::apply_deposit(&mut conn, &company_id, &contact_id, &invoice_id, amount_kobo, &application_date, &c).map_err(Into::into)
+}
+
+#[derive(Serialize)]
+struct RefundDepositDto { payment_id: String, entry_id: String }
+
+#[tauri::command]
+fn refund_deposit_cmd(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, contact_id: String,
+    bank_account_id: String, refund_date: String, amount_kobo: i64, confirm_soft_close: bool,
+) -> Result<RefundDepositDto, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    let c = ctx(&sess, confirm_soft_close)?;
+    let result = engine::refund_deposit(&mut conn, &company_id, &contact_id, &bank_account_id, &refund_date, amount_kobo, &c)?;
+    Ok(RefundDepositDto { payment_id: result.payment_id, entry_id: result.entry_id })
+}
+
 #[derive(Serialize)]
 struct OpenInvoiceDto { id: String, number: String, due_date: String, balance_kobo: i64 }
 
@@ -2021,6 +2069,7 @@ fn post_manual_journal(
 #[derive(Serialize)]
 struct CompanySettingsDto {
     vat_registered: bool, vat_exempt: bool, cit_exempt: bool, vat_rate_bp: i64,
+    soft_close_through: Option<String>,
     hard_close_through: Option<String>,
     writeoff_limit_kobo: i64, writeoff_debit_account_id: Option<String>, writeoff_credit_account_id: Option<String>,
     fiscal_year_start_month: i64,
@@ -2031,17 +2080,28 @@ fn company_settings(state: tauri::State<Db>, sess: tauri::State<Sess>, company_i
     let conn = state.0.lock().unwrap();
     sess.0.require_advisor_elevated(&conn)?;
     conn.query_row(
-        "SELECT vat_registered, vat_exempt, cit_exempt, vat_rate_bp, hard_close_through,
+        "SELECT vat_registered, vat_exempt, cit_exempt, vat_rate_bp, soft_close_through, hard_close_through,
                 writeoff_limit_kobo, writeoff_debit_account_id, writeoff_credit_account_id, fiscal_year_start_month
          FROM companies WHERE id = ?1",
         rusqlite::params![company_id],
         |r| Ok(CompanySettingsDto {
             vat_registered: r.get::<_, i64>(0)? != 0, vat_exempt: r.get::<_, i64>(1)? != 0, cit_exempt: r.get::<_, i64>(2)? != 0,
-            vat_rate_bp: r.get(3)?, hard_close_through: r.get(4)?,
-            writeoff_limit_kobo: r.get(5)?, writeoff_debit_account_id: r.get(6)?, writeoff_credit_account_id: r.get(7)?,
-            fiscal_year_start_month: r.get(8)?,
+            vat_rate_bp: r.get(3)?, soft_close_through: r.get(4)?, hard_close_through: r.get(5)?,
+            writeoff_limit_kobo: r.get(6)?, writeoff_debit_account_id: r.get(7)?, writeoff_credit_account_id: r.get(8)?,
+            fiscal_year_start_month: r.get(9)?,
         }),
     ).map_err(db_err)
+}
+
+#[tauri::command]
+fn update_soft_close_cmd(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, soft_close_through: Option<String>,
+) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    conn.execute("UPDATE companies SET soft_close_through = ?2 WHERE id = ?1", rusqlite::params![company_id, soft_close_through])
+        .map_err(db_err)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2301,6 +2361,19 @@ fn export_wht_credit_xlsx(state: tauri::State<Db>, company_id: String, company_n
     xlsx_base64(export_xlsx::export_wht_credit(&header, &rows))
 }
 
+#[tauri::command]
+fn export_contact_statement_xlsx(
+    state: tauri::State<Db>, company_id: String, company_name: String, contact_id: String, start: String, end: String,
+) -> Result<String, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let cs = reports::contact_statement(&conn, &company_id, &contact_id, &start, &end)?;
+    let header = ExportHeader {
+        company_name: &company_name, report_title: &format!("Statement of Account — {}", cs.contact_name),
+        period_label: &format!("{start} to {end}"), generated_at: &ledger_core::ids::now_iso(),
+    };
+    xlsx_base64(export_xlsx::export_contact_statement(&header, &cs))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -2342,6 +2415,9 @@ pub fn run() {
             send_invoice,
             list_invoices,
             open_invoices,
+            list_customer_deposits,
+            apply_deposit_cmd,
+            refund_deposit_cmd,
             record_payment_in,
             list_bank_accounts,
             expense_categories,
@@ -2389,6 +2465,7 @@ pub fn run() {
             company_settings,
             update_tax_settings_cmd,
             update_hard_close_cmd,
+            update_soft_close_cmd,
             update_writeoff_settings_cmd,
             compliance_banners_cmd,
             ack_vat_threshold_cmd,
@@ -2411,6 +2488,7 @@ pub fn run() {
             export_vat_report_xlsx,
             export_wht_remittance_xlsx,
             export_wht_credit_xlsx,
+            export_contact_statement_xlsx,
             backup_shell::backup_settings_get,
             backup_shell::backup_settings_update,
             backup_shell::backup_now,

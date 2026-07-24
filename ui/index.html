@@ -1417,12 +1417,23 @@ async function exportReportXlsx(btnId, filename, command, args){
 const CONTACT_ROW_CHIP = { ready:["paid","Ready"], warning:["partially_paid","Warning"], error:["overdue","Error"] };
 
 async function viewContacts(){
-  const [customers, suppliers] = await Promise.all([
+  const [customers, suppliers, deposits] = await Promise.all([
     invoke("list_contacts",{companyId:CO.id, kind:"customer"}),
     invoke("list_contacts",{companyId:CO.id, kind:"supplier"}),
+    invoke("list_customer_deposits",{companyId:CO.id}),
   ]);
-  const listTable = list => `<table><tr><th>Name</th><th>Phone</th></tr>
-    ${list.map(c=>`<tr><td>${esc(c.name)}</td><td>${esc(c.phone||"")}</td></tr>`).join("")}</table>`;
+  const listTable = list => `<table><tr><th>Name</th><th>Phone</th><th></th></tr>
+    ${list.map(c=>`<tr><td>${esc(c.name)}</td><td>${esc(c.phone||"")}</td>
+      <td><a class="navlink" data-stmt="${c.id}" data-stmtname="${esc(c.name)}">Statement</a></td></tr>`).join("")}</table>`;
+
+  const depositsHtml = !deposits.length ? "" : `<div class="card"><h3>Customer paid ahead</h3>
+    <table><tr><th>Customer</th><th>Held</th><th></th></tr>
+      ${deposits.map(d=>`<tr><td>${esc(d.name)}</td><td>${naira(d.deposit_kobo)}</td>
+        <td><a class="navlink" data-dep-apply="${d.contact_id}" data-dep-amt="${d.deposit_kobo}" data-dep-name="${esc(d.name)}">Apply to an invoice</a>
+        <a class="navlink" data-dep-refund="${d.contact_id}" data-dep-amt="${d.deposit_kobo}" data-dep-name="${esc(d.name)}">Refund</a></td></tr>`).join("")}
+    </table>
+    <div id="depositarea"></div>
+  </div>`;
 
   chrome("contacts", `<div class="card"><h3>Contacts</h3>
     <div class="row">
@@ -1436,7 +1447,8 @@ async function viewContacts(){
       <div class="row"><div><label>File (.xlsx or .csv)</label><input type="file" id="cfile" accept=".xlsx,.xls,.csv,.txt"/></div></div>
       <button class="ghost" id="c-preview" style="margin-top:8px">Preview</button>
       <div id="c-previewarea"></div>
-    </details></div>`);
+    </details></div>
+    ${depositsHtml}`);
 
   el("c-template").onclick = () => downloadCsv("contacts-template.csv", [
     ["name","kind","phone","email","tin","address","terms_days"],
@@ -1482,6 +1494,82 @@ async function viewContacts(){
       } catch(e){ err(e); }
     };
   }
+
+  document.querySelectorAll("[data-stmt]").forEach(a => a.onclick = () => viewContactStatement(a.dataset.stmt, a.dataset.stmtname));
+
+  document.querySelectorAll("[data-dep-apply]").forEach(a => a.onclick = async () => {
+    const contactId = a.dataset.depApply, maxAmt = parseInt(a.dataset.depAmt,10), name = a.dataset.depName;
+    const invs = await invoke("open_invoices",{companyId:CO.id, contactId});
+    const area = el("depositarea");
+    if (!invs.length) return err({message:`${name} has no open invoices to apply this to.`});
+    area.innerHTML = `<div class="card"><h3>Apply ${esc(name)}'s deposit</h3>
+      <div class="row">
+        <div><label>Invoice</label><select id="dep-inv">${invs.map(i=>`<option value="${i.id}" data-bal="${i.balance_kobo}">${esc(i.number)} — owes ${naira(i.balance_kobo)}</option>`).join("")}</select></div>
+        <div><label>Amount (₦)</label><input type="text" id="dep-amt" value="${(Math.min(maxAmt, invs[0].balance_kobo)/100).toFixed(2)}" placeholder="0.00"/></div>
+      </div>
+      <button id="dep-go">Apply</button> <button class="ghost" id="dep-cancel">Cancel</button></div>`;
+    el("dep-cancel").onclick = () => { area.innerHTML = ""; };
+    el("dep-go").onclick = async () => {
+      try {
+        await invoke("apply_deposit_cmd",{companyId:CO.id, contactId, invoiceId:el("dep-inv").value,
+          amountKobo:kobo(el("dep-amt").value), applicationDate:today(), confirmSoftClose:false});
+        toast("Deposit applied to the invoice.");
+        viewContacts();
+      } catch(e){ err(e); }
+    };
+  });
+
+  document.querySelectorAll("[data-dep-refund]").forEach(a => a.onclick = async () => {
+    const contactId = a.dataset.depRefund, maxAmt = parseInt(a.dataset.depAmt,10), name = a.dataset.depName;
+    const banks = await invoke("list_bank_accounts",{companyId:CO.id});
+    const area = el("depositarea");
+    area.innerHTML = `<div class="card"><h3>Refund ${esc(name)}'s deposit</h3>
+      <div class="row">
+        <div><label>From account</label><select id="dep-bank">${banks.map(b=>`<option value="${b.id}">${esc(b.label)}</option>`).join("")}</select></div>
+        <div><label>Amount (₦)</label><input type="text" id="dep-ramt" value="${(maxAmt/100).toFixed(2)}" placeholder="0.00"/></div>
+      </div>
+      <button id="dep-rgo">Refund</button> <button class="ghost" id="dep-rcancel">Cancel</button></div>`;
+    el("dep-rcancel").onclick = () => { area.innerHTML = ""; };
+    el("dep-rgo").onclick = async () => {
+      try {
+        await invoke("refund_deposit_cmd",{companyId:CO.id, contactId, bankAccountId:el("dep-bank").value,
+          refundDate:today(), amountKobo:kobo(el("dep-ramt").value), confirmSoftClose:false});
+        toast("Deposit refunded.");
+        viewContacts();
+      } catch(e){ err(e); }
+    };
+  });
+}
+
+// ── Contact statement of account (Spec 05 §6) ──
+async function viewContactStatement(contactId, name){
+  const yearStart = `${today().slice(0,4)}-01-01`;
+  let start = yearStart, end = today();
+
+  async function paint(){
+    const s = await invoke("contact_statement",{companyId:CO.id, contactId, start, end});
+    chrome("contacts", `<div class="card"><h3>Statement — ${esc(name)}</h3>
+      <div class="row">
+        <div><label>From</label><input type="date" id="cs-start" value="${start}"/></div>
+        <div><label>To</label><input type="date" id="cs-end" value="${end}"/></div>
+        <div style="align-self:flex-end"><button class="ghost" id="cs-go">Update</button></div>
+        <div style="align-self:flex-end"><button class="ghost" id="cs-export">Export .xlsx</button></div>
+      </div>
+      ${s.deposit_kobo>0?`<div class="mut" style="margin-top:8px">Holding ${naira(s.deposit_kobo)} paid ahead — see Contacts to apply or refund it.</div>`:""}
+      <table style="margin-top:12px"><tr><th>Date</th><th>Description</th><th>Charged</th><th>Paid</th><th>Balance</th></tr>
+        <tr><td colspan="4" class="mut">Opening balance</td><td>${naira(s.opening_balance_kobo)}</td></tr>
+        ${s.lines.map(l=>`<tr><td>${dmy(l.date)}</td><td>${esc(l.description)}</td>
+          <td>${l.debit_kobo?naira(l.debit_kobo):""}</td><td>${l.credit_kobo?naira(l.credit_kobo):""}</td>
+          <td>${naira(l.running_balance_kobo)}</td></tr>`).join("")}
+        <tr><td colspan="4"><b>Closing balance</b></td><td><b>${naira(s.closing_balance_kobo)}</b></td></tr>
+      </table>
+      <div class="nav"><button class="ghost" id="cs-back">Back to Contacts</button></div></div>`);
+    el("cs-back").onclick = viewContacts;
+    el("cs-go").onclick = () => { start = el("cs-start").value; end = el("cs-end").value; paint(); };
+    el("cs-export").onclick = () => exportReportXlsx("cs-export", `statement-${name}.xlsx`, "export_contact_statement_xlsx",
+      {companyId:CO.id, companyName:CO.name, contactId, start, end});
+  }
+  await paint();
 }
 
 async function viewProducts(){
@@ -1631,7 +1719,8 @@ async function viewSettings(){
       </div>
       <div class="row">
         <div><label>VAT rate (%)</label><input type="text" id="s-vatrate" value="${(cs.vat_rate_bp/100).toFixed(2)}" style="max-width:120px"/></div>
-        <div><label>Period lock — nothing before this date can be changed</label><input type="date" id="s-hardclose" value="${cs.hard_close_through||""}"/></div>
+        <div><label>Soft close — entries before this date need confirmation</label><input type="date" id="s-softclose" value="${cs.soft_close_through||""}"/></div>
+        <div><label>Hard lock — nothing before this date can be changed at all</label><input type="date" id="s-hardclose" value="${cs.hard_close_through||""}"/></div>
       </div>
       <div class="row">
         <div><label>Write-off limit (₦)</label><input type="text" id="s-wolimit" value="${(cs.writeoff_limit_kobo/100).toFixed(2)}" style="max-width:160px"/></div>
@@ -1677,6 +1766,7 @@ async function viewSettings(){
       await invoke("update_tax_settings_cmd",{companyId:CO.id,
         vatRegistered:el("s-vatreg").checked, vatExempt:el("s-vatex").checked, citExempt:el("s-citex").checked,
         vatRateBp: Math.round(parseFloat(el("s-vatrate").value||"0")*100)});
+      await invoke("update_soft_close_cmd",{companyId:CO.id, softCloseThrough: el("s-softclose").value || null});
       await invoke("update_hard_close_cmd",{companyId:CO.id, hardCloseThrough: el("s-hardclose").value || null});
       await invoke("update_writeoff_settings_cmd",{companyId:CO.id,
         limitKobo: kobo(el("s-wolimit").value), debitAccountId: el("s-wodebit").value, creditAccountId: el("s-wocredit").value});
