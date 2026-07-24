@@ -9,6 +9,7 @@ use ledger_core::engine::{self, PostCtx};
 use ledger_core::rusqlite::{self, Connection, OptionalExtension};
 use ledger_core::seed::{self, CompanyConfig};
 use ledger_core::EngineError;
+use ledger_core::LineSpec;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::Manager;
@@ -1989,6 +1990,113 @@ fn list_accounts(state: tauri::State<Db>, company_id: String) -> Result<Vec<Acco
     Ok(rows)
 }
 
+/// Manual journal entries (Spec 01 §6.7 / Spec 07 §5 capability table) —
+/// Advisor Mode only, the one Spec 07 capability with a real engine function
+/// (`engine::post_journal`) that had never been wrapped in a command.
+#[derive(Deserialize)]
+pub struct JournalLineDto { pub account_id: String, pub amount_kobo: i64, pub contact_id: Option<String> }
+
+#[tauri::command]
+fn post_manual_journal(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, entry_date: String, memo: String,
+    lines: Vec<JournalLineDto>, confirm_soft_close: bool,
+) -> Result<String, CmdError> {
+    let mut conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    let ctx = ctx(&sess, confirm_soft_close)?;
+    let specs: Vec<LineSpec> = lines
+        .iter()
+        .map(|l| match &l.contact_id {
+            Some(c) => LineSpec::with_contact(&l.account_id, l.amount_kobo, c),
+            None => LineSpec::new(&l.account_id, l.amount_kobo),
+        })
+        .collect();
+    engine::post_journal(&mut conn, &company_id, &entry_date, &memo, "manual", &ctx, &specs).map_err(Into::into)
+}
+
+// ===== Advisor-only company settings (Spec 07 §5) =====
+
+#[derive(Serialize)]
+struct CompanySettingsDto {
+    vat_registered: bool, vat_exempt: bool, cit_exempt: bool, vat_rate_bp: i64,
+    hard_close_through: Option<String>,
+    writeoff_limit_kobo: i64, writeoff_debit_account_id: Option<String>, writeoff_credit_account_id: Option<String>,
+    fiscal_year_start_month: i64,
+}
+
+#[tauri::command]
+fn company_settings(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String) -> Result<CompanySettingsDto, CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    conn.query_row(
+        "SELECT vat_registered, vat_exempt, cit_exempt, vat_rate_bp, hard_close_through,
+                writeoff_limit_kobo, writeoff_debit_account_id, writeoff_credit_account_id, fiscal_year_start_month
+         FROM companies WHERE id = ?1",
+        rusqlite::params![company_id],
+        |r| Ok(CompanySettingsDto {
+            vat_registered: r.get::<_, i64>(0)? != 0, vat_exempt: r.get::<_, i64>(1)? != 0, cit_exempt: r.get::<_, i64>(2)? != 0,
+            vat_rate_bp: r.get(3)?, hard_close_through: r.get(4)?,
+            writeoff_limit_kobo: r.get(5)?, writeoff_debit_account_id: r.get(6)?, writeoff_credit_account_id: r.get(7)?,
+            fiscal_year_start_month: r.get(8)?,
+        }),
+    ).map_err(db_err)
+}
+
+#[tauri::command]
+fn update_tax_settings_cmd(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String,
+    vat_registered: bool, vat_exempt: bool, cit_exempt: bool, vat_rate_bp: i64,
+) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    ledger_core::compliance::update_tax_settings(&conn, &company_id, vat_registered, vat_exempt, cit_exempt, vat_rate_bp)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn update_hard_close_cmd(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String, hard_close_through: Option<String>,
+) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    ledger_core::compliance::update_hard_close(&conn, &company_id, hard_close_through.as_deref()).map_err(Into::into)
+}
+
+#[tauri::command]
+fn update_writeoff_settings_cmd(
+    state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String,
+    limit_kobo: i64, debit_account_id: String, credit_account_id: String,
+) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    ledger_core::compliance::update_writeoff_settings(&conn, &company_id, limit_kobo, &debit_account_id, &credit_account_id)
+        .map_err(Into::into)
+}
+
+#[derive(Serialize)]
+struct ComplianceBannerDto { kind: String, message: String, ytd_revenue_kobo: i64 }
+
+#[tauri::command]
+fn compliance_banners_cmd(state: tauri::State<Db>, company_id: String) -> Result<Vec<ComplianceBannerDto>, CmdError> {
+    let conn = state.0.lock().unwrap();
+    let banners = ledger_core::compliance::compliance_banners(&conn, &company_id)?;
+    Ok(banners.into_iter().map(|b| ComplianceBannerDto { kind: b.kind.to_string(), message: b.message, ytd_revenue_kobo: b.ytd_revenue_kobo }).collect())
+}
+
+#[tauri::command]
+fn ack_vat_threshold_cmd(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    ledger_core::compliance::ack_vat_threshold(&conn, &company_id).map_err(Into::into)
+}
+
+#[tauri::command]
+fn ack_cit_threshold_cmd(state: tauri::State<Db>, sess: tauri::State<Sess>, company_id: String) -> Result<(), CmdError> {
+    let conn = state.0.lock().unwrap();
+    sess.0.require_advisor_elevated(&conn)?;
+    ledger_core::compliance::ack_cit_threshold(&conn, &company_id).map_err(Into::into)
+}
+
 // --- Tax reports (Spec 05 §5) ---
 
 #[derive(Serialize)]
@@ -2274,6 +2382,14 @@ pub fn run() {
             trial_balance,
             general_ledger,
             list_accounts,
+            post_manual_journal,
+            company_settings,
+            update_tax_settings_cmd,
+            update_hard_close_cmd,
+            update_writeoff_settings_cmd,
+            compliance_banners_cmd,
+            ack_vat_threshold_cmd,
+            ack_cit_threshold_cmd,
             vat_report,
             wht_remittance_schedule,
             wht_credit_schedule,

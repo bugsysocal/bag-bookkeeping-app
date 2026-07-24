@@ -5,6 +5,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_initial.sql"),
     include_str!("../migrations/0002_license.sql"),
     include_str!("../migrations/0003_imported_paid.sql"),
+    include_str!("../migrations/0004_compliance_ack.sql"),
 ];
 
 /// Open (or create) a LedgerOne database and bring it to the current schema.

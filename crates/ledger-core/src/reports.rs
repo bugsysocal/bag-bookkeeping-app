@@ -113,20 +113,21 @@ pub struct AgingRow {
     pub deposit_kobo: i64, // shown alongside, NEVER subtracted from buckets (Spec 05 §3.2 / decision #4)
 }
 
+/// Days-from-civil (Howard Hinnant), inverse of `ids::civil_from_days` — the
+/// same proleptic calendar throughout the crate, no chrono. `pub(crate)`
+/// since `backup.rs` needs it too for retention-ladder day/week bucketing.
+pub(crate) fn to_days(date: &str) -> i64 {
+    let (y, m, d) = ymd(date);
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe.div_euclid(4) - yoe.div_euclid(100) + doy;
+    era * 146097 + doe - 719468
+}
+
 fn days_between(as_of: &str, due: &str) -> i64 {
-    // Both are ISO Y-M-D; convert to a day-index via the same proleptic
-    // calendar as ids.rs so subtraction is exact without pulling in chrono.
-    fn to_days(date: &str) -> i64 {
-        let (y, m, d) = ymd(date);
-        // days-from-civil (Howard Hinnant), inverse of ids::civil_from_days.
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let mp = if m > 2 { m - 3 } else { m + 9 };
-        let doy = (153 * mp as i64 + 2) / 5 + d as i64 - 1;
-        let doe = yoe * 365 + yoe.div_euclid(4) - yoe.div_euclid(100) + doy;
-        era * 146097 + doe - 719468
-    }
     to_days(as_of) - to_days(due)
 }
 

@@ -443,6 +443,7 @@ function chrome(active, body){
       <a class="navlink" id="n-contacts">Contacts</a>
       <a class="navlink" id="n-products">Products</a>
       <a class="navlink" id="n-reports">Reports</a>
+      <a class="navlink" id="n-settings">Settings</a>
       <span id="n-advisor-wrap"></span>
       <span class="spacer"></span>
       <button id="a-newinv">New Invoice</button>
@@ -452,6 +453,7 @@ function chrome(active, body){
   el("n-home").onclick = viewDashboard; el("n-inv").onclick = viewInvoices;
   el("n-pur").onclick = viewPurchases; el("n-bank").onclick = viewBank;
   el("n-pays").onclick = viewPayments; el("n-reports").onclick = () => viewReports();
+  el("n-settings").onclick = viewSettings;
   el("n-contacts").onclick = viewContacts;
   el("n-products").onclick = viewProducts;
   el("a-newinv").onclick = () => viewNewInvoice(false);
@@ -1559,6 +1561,126 @@ async function viewPayments(){
     try { await invoke("void_payment_cmd",{paymentId:a.dataset.vp, confirmSoftClose:false});
       toast("Payment cancelled."); viewPayments(); } catch(e){ err(e); }
   });
+}
+
+// ════════ Settings (Spec 07 §5 capability table + Spec 08 backups) ════════
+
+let JOURNAL_LINES = [{acct:"", amt:"", contact:""}, {acct:"", amt:"", contact:""}];
+
+// LEXICON-EXEMPT: the substantive content here (tax settings, write-off
+// routing, manual journal entries) is Advisor Mode only per Spec 07 §5's
+// capability table — only the plain-language gate messages are owner-facing,
+// and those don't use the forbidden words.
+async function viewSettings(){
+  const banners = await invoke("compliance_banners_cmd",{companyId:CO.id});
+  const complianceHtml = `<div class="card"><h3>Compliance</h3>
+    ${banners.length ? banners.map(b=>`<div class="banner-row">${esc(b.message)}
+        ${SESSION.advisor_active?`<a class="navlink" data-ack="${b.kind}" style="margin-left:8px">Reviewed, no change needed for now</a>`:""}</div>`).join("")
+      : `<div class="mut">No threshold crossings to review.</div>`}
+    </div>`;
+
+  let advisorHtml, accounts = [], contacts = [];
+  if (SESSION.role === "staff"){
+    advisorHtml = `<div class="mut">Not available for your role.</div>`;
+  } else if (!SESSION.advisor_active){
+    advisorHtml = `<div class="mut">Enter Advisor Mode (top right) to manage tax settings, the period lock, write-off routing, and post manual journal entries.</div>`;
+  } else {
+    const [cs, accts, cts] = await Promise.all([
+      invoke("company_settings",{companyId:CO.id}),
+      invoke("list_accounts",{companyId:CO.id}),
+      invoke("list_contacts",{companyId:CO.id, kind:null}),
+    ]);
+    accounts = accts; contacts = cts;
+    advisorHtml = `
+      <div class="row">
+        <div><label><input type="checkbox" id="s-vatreg" ${cs.vat_registered?"checked":""}/> VAT registered</label></div>
+        <div><label><input type="checkbox" id="s-vatex" ${cs.vat_exempt?"checked":""}/> Small business VAT relief (turnover ≤ ₦50m)</label></div>
+        <div><label><input type="checkbox" id="s-citex" ${cs.cit_exempt?"checked":""}/> Small company tax relief (turnover ≤ ₦100m &amp; assets ≤ ₦250m)</label></div>
+      </div>
+      <div class="row">
+        <div><label>VAT rate (%)</label><input type="text" id="s-vatrate" value="${(cs.vat_rate_bp/100).toFixed(2)}" style="max-width:120px"/></div>
+        <div><label>Period lock — nothing before this date can be changed</label><input type="date" id="s-hardclose" value="${cs.hard_close_through||""}"/></div>
+      </div>
+      <div class="row">
+        <div><label>Write-off limit (₦)</label><input type="text" id="s-wolimit" value="${(cs.writeoff_limit_kobo/100).toFixed(2)}" style="max-width:160px"/></div>
+        <div><label>Write-off debit account</label><select id="s-wodebit">${accounts.map(a=>`<option value="${a.id}" ${a.id===cs.writeoff_debit_account_id?"selected":""}>${esc(a.code)} ${esc(a.name)}</option>`).join("")}</select></div>
+        <div><label>Write-off credit account</label><select id="s-wocredit">${accounts.map(a=>`<option value="${a.id}" ${a.id===cs.writeoff_credit_account_id?"selected":""}>${esc(a.code)} ${esc(a.name)}</option>`).join("")}</select></div>
+      </div>
+      <button id="s-save" style="margin-top:8px">Save settings</button>
+      <div class="mut" style="margin-top:4px">These affect every user of these books — that's why they're Advisor Mode only.</div>`;
+  }
+
+  const journalHtml = !SESSION.advisor_active ? "" : `<div class="card"><h3>Post a manual journal entry</h3>
+    <div class="mut" style="margin-bottom:8px">For adjustments, depreciation, and corrections a normal screen doesn't cover. Amounts must balance to zero before this will post.</div>
+    <div class="row"><div><label>Date</label><input type="date" id="j-date" value="${today()}"/></div>
+      <div style="flex:2"><label>Memo</label><input type="text" id="j-memo" placeholder="What is this entry for?"/></div></div>
+    <table id="j-lines"><tr><th>Account</th><th>Amount (₦, negative for credit)</th><th>Contact (only for customer/supplier accounts)</th><th></th></tr>
+      ${JOURNAL_LINES.map((l,i)=>`<tr>
+        <td><select data-ji="${i}" data-jk="acct"><option value="">— choose —</option>${accounts.map(a=>`<option value="${a.id}" ${a.id===l.acct?"selected":""}>${esc(a.code)} ${esc(a.name)}</option>`).join("")}</select></td>
+        <td><input type="text" data-ji="${i}" data-jk="amt" value="${esc(l.amt)}" placeholder="0.00" style="text-align:right"/></td>
+        <td><select data-ji="${i}" data-jk="contact"><option value="">— none —</option>${contacts.map(c=>`<option value="${c.id}" ${c.id===l.contact?"selected":""}>${esc(c.name)}</option>`).join("")}</select></td>
+        <td>${JOURNAL_LINES.length>2?`<a class="navlink" data-jdel="${i}">Remove</a>`:""}</td>
+      </tr>`).join("")}
+    </table>
+    <button class="ghost" id="j-addline" style="margin-top:8px">Add line</button>
+    <div id="j-balance" class="mut" style="margin:8px 0"></div>
+    <button id="j-post">Post journal entry</button>
+  </div>`;
+
+  chrome("settings", `<div class="card"><h3>Settings</h3></div>
+    ${complianceHtml}
+    <div class="card"><h3>Tax &amp; period settings</h3>${advisorHtml}</div>
+    ${journalHtml}
+    <div id="backupsection"></div>`);
+
+  document.querySelectorAll("[data-ack]").forEach(a => a.onclick = async () => {
+    try {
+      await invoke(a.dataset.ack==="vat_threshold" ? "ack_vat_threshold_cmd" : "ack_cit_threshold_cmd", {companyId:CO.id});
+      viewSettings();
+    } catch(e){ err(e); }
+  });
+
+  if (el("s-save")) el("s-save").onclick = async () => {
+    try {
+      await invoke("update_tax_settings_cmd",{companyId:CO.id,
+        vatRegistered:el("s-vatreg").checked, vatExempt:el("s-vatex").checked, citExempt:el("s-citex").checked,
+        vatRateBp: Math.round(parseFloat(el("s-vatrate").value||"0")*100)});
+      await invoke("update_hard_close_cmd",{companyId:CO.id, hardCloseThrough: el("s-hardclose").value || null});
+      await invoke("update_writeoff_settings_cmd",{companyId:CO.id,
+        limitKobo: kobo(el("s-wolimit").value), debitAccountId: el("s-wodebit").value, creditAccountId: el("s-wocredit").value});
+      toast("Settings saved.");
+      viewSettings();
+    } catch(e){ err(e); }
+  };
+
+  if (el("j-addline")){
+    el("j-addline").onclick = () => { JOURNAL_LINES.push({acct:"",amt:"",contact:""}); viewSettings(); };
+    document.querySelectorAll("[data-jdel]").forEach(a => a.onclick = () => {
+      JOURNAL_LINES.splice(parseInt(a.dataset.jdel,10),1); viewSettings();
+    });
+    const syncLines = () => {
+      document.querySelectorAll("[data-ji]").forEach(f => {
+        const i = parseInt(f.dataset.ji,10), k = f.dataset.jk;
+        JOURNAL_LINES[i][k] = f.value;
+      });
+      const total = JOURNAL_LINES.reduce((s,l)=>s+kobo(l.amt||"0"),0);
+      el("j-balance").textContent = total===0 ? "Balances to zero — ready to post." : `Off by ${naira(Math.abs(total))} — lines must sum to zero.`;
+    };
+    document.querySelectorAll("[data-ji]").forEach(f => f.addEventListener("input", syncLines));
+    document.querySelectorAll("[data-ji]").forEach(f => f.addEventListener("change", syncLines));
+    syncLines();
+    el("j-post").onclick = async () => {
+      syncLines();
+      const lines = JOURNAL_LINES.filter(l=>l.acct && l.amt).map(l => ({account_id:l.acct, amount_kobo:kobo(l.amt), contact_id:l.contact||null}));
+      if (lines.length < 2) return err({message:"Add at least two lines."});
+      try {
+        await invoke("post_manual_journal",{companyId:CO.id, entryDate:el("j-date").value, memo:el("j-memo").value, lines, confirmSoftClose:false});
+        toast("Journal entry posted.");
+        JOURNAL_LINES = [{acct:"",amt:"",contact:""},{acct:"",amt:"",contact:""}];
+        viewSettings();
+      } catch(e){ err(e); }
+    };
+  }
 }
 
 // ════════ Reports (Spec 05) ════════
